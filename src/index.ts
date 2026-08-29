@@ -36,8 +36,8 @@ import type {} from '@deepseek-ai/dsh-token-meter'
 
 export const name = 'context-guard'
 
-/** Required services: routed-model metadata, token measurement, compaction, and the live agent registry. */
-export const inject = ['llm', 'tokenMeter', 'compaction', 'agents']
+/** Required services: routed-model metadata, token measurement, and the live agent registry. */
+export const inject = ['llm', 'tokenMeter', 'agents']
 
 /**
  * Plugin config, validated by the same-named schemastery schema. An empty
@@ -77,7 +77,10 @@ const DEFAULT_RESUME_PROMPT =
   '上下文压缩已完成。请继续执行压缩前正在进行的任务，直到任务完成。'
 
 export const Config: z<Config> = z.object({
-  thresholdRatio: z.number().min(0).max(1).default(0.85),
+  // Unbounded on purpose: an out-of-range ratio is normalized in apply (with
+  // a logged fallback) instead of failing plugin load, so a misconfiguration
+  // can never take the host process down.
+  thresholdRatio: z.number().default(0.85),
   wrapUpPrompt: z.string().default(DEFAULT_WRAP_UP_PROMPT),
   resumePrompt: z.string().default(DEFAULT_RESUME_PROMPT),
   autoCompactOnIdle: z.boolean().default(true),
@@ -123,18 +126,21 @@ interface EpisodeState {
  * Install the guard's listeners.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
  * @param config - validated {@link Config}; schemastery's `.default()` guarantees
- *   the fields are set after validation, re-checked fail-loud for the ratio.
+ *   the fields are set after validation. An invalid ratio never throws: the
+ *   guard reports it and falls back to the default, so a misconfiguration can
+ *   never take the host process down.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const thresholdRatio = config.thresholdRatio as number
+  let thresholdRatio = config.thresholdRatio as number
   const wrapUpPrompt = config.wrapUpPrompt as string
   const resumePrompt = config.resumePrompt as string
   const autoCompactOnIdle = config.autoCompactOnIdle as boolean
   const resumeAfterCompact = config.resumeAfterCompact as boolean
   if (!Number.isFinite(thresholdRatio) || thresholdRatio < 0 || thresholdRatio > 1) {
-    throw new Error(
-      `context-guard: invalid thresholdRatio ${thresholdRatio} — must be a finite number in [0, 1]`,
+    ctx.logger.error(
+      `context-guard: invalid thresholdRatio ${thresholdRatio} — must be a finite number in [0, 1]; using default 0.85`,
     )
+    thresholdRatio = 0.85
   }
 
   const states = new WeakMap<Session, EpisodeState>()
@@ -238,12 +244,16 @@ export function apply(ctx: Context, config: Config = {}): void {
     // Deferred: this listener runs inside the compaction/end append dispatch,
     // and appending the follow-up splice would reenter that publication.
     queueMicrotask(() => {
-      if (agent.status !== 'idle') return
-      agent.followup(createUserMessage({
-        content: [{ type: 'text', text: resumePrompt }],
-        source: pluginSource(RESUME_SUMMARY),
-      }))
-      ctx.logger.info(`context-guard: resumed ${agent.id} after compaction`)
+      try {
+        if (agent.status !== 'idle') return
+        agent.followup(createUserMessage({
+          content: [{ type: 'text', text: resumePrompt }],
+          source: pluginSource(RESUME_SUMMARY),
+        }))
+        ctx.logger.info(`context-guard: resumed ${agent.id} after compaction`)
+      } catch (error: unknown) {
+        ctx.logger.warn(`context-guard: resume after compaction failed for ${agent.id}: ${String(error)}`)
+      }
     })
   })
 
@@ -253,18 +263,24 @@ export function apply(ctx: Context, config: Config = {}): void {
   // A tool-continuation step may claim nothing (tool results enter the model
   // history from the log), so the reminder folds into an empty entered batch;
   // only a genuinely empty FIRST step owns a no-request turn and keeps the
-  // reminder pending.
+  // reminder pending. Any guard failure here degrades to the unmodified
+  // decision, so the loop is never disturbed.
   ctx.on('agent/pre-step', async ({ agent, messages, step }, next): Promise<PreStepDecision> => {
-    const state = stateOf(agent.session)
-    await state.evaluation
-    const reminder = state.pendingReminder
-    if (reminder === undefined) return next()
-    const decision = await next()
-    if (decision.kind === 'reject' || (step === 1 && decision.messages.length === 0)) return decision
-    state.pendingReminder = undefined
-    const lastClaimedIndex = decision.messages.findLastIndex(message => messages.includes(message))
-    const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, reminder)
-    return { ...decision, messages: entered }
+    try {
+      const state = stateOf(agent.session)
+      await state.evaluation
+      const reminder = state.pendingReminder
+      if (reminder === undefined) return next()
+      const decision = await next()
+      if (decision.kind === 'reject' || (step === 1 && decision.messages.length === 0)) return decision
+      state.pendingReminder = undefined
+      const lastClaimedIndex = decision.messages.findLastIndex(message => messages.includes(message))
+      const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, reminder)
+      return { ...decision, messages: entered }
+    } catch (error: unknown) {
+      ctx.logger.warn(`context-guard: pre-step fold failed for ${agent.id}: ${String(error)}`)
+      return next()
+    }
   })
 
   const compactionController = new AbortController()
@@ -275,6 +291,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (status !== 'idle') return
     void handleIdle(agent)
   })
+
+  /** Warn once per plugin instance when no compaction provider is available. */
+  let warnedNoProvider = false
 
   /** Compact one idle over-threshold session, once per episode. */
   async function handleIdle(agent: Agent): Promise<void> {
@@ -290,7 +309,18 @@ export function apply(ctx: Context, config: Config = {}): void {
         return
       }
       if (!autoCompactOnIdle || state.compacted) return
-      const result = await ctx.compaction.compactNow(agent, compactionSignal)
+      // Compaction is an optional service: web compositions may leave it to
+      // their agent presets, so a missing provider degrades hooks 2/3 (with
+      // the wrap-up reminder still active) instead of blocking boot.
+      const compaction = ctx.get('compaction')
+      if (compaction === undefined) {
+        if (!warnedNoProvider) {
+          warnedNoProvider = true
+          ctx.logger.warn('context-guard: no compaction provider loaded; idle auto-compaction is disabled')
+        }
+        return
+      }
+      const result = await compaction.compactNow(agent, compactionSignal)
       if (result !== null) {
         state.compacted = true
         ctx.logger.info(

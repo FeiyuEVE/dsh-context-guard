@@ -33,11 +33,12 @@ async function harness(
   script: ScriptEntry[],
   config: Config = {},
   contextWindow = 300,
-): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine; adapter: MockAdapter }> {
+  withCompaction = true,
+): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine | undefined; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   await ctx.plugin(TokenMeter)
-  const compaction = new StubCompactionEngine(ctx)
+  const compaction = withCompaction ? new StubCompactionEngine(ctx) : undefined
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(ContextGuard, config)
   ctx.tools.register(defineContentToolFixture({
@@ -101,7 +102,7 @@ describe('context-guard full loop', () => {
     expect(wrapUpSeq).toBeLessThan(wrapUpResponse!.seq)
 
     // Hook 2: exactly one successful idle compaction.
-    expect(compaction.compactNowCalls).toEqual([1])
+    expect(compaction!.compactNowCalls).toEqual([1])
     expect(compactionEndCount(agent)).toBe(1)
 
     // Hook 3: exactly one resume prompt, opened as a second turn.
@@ -112,7 +113,7 @@ describe('context-guard full loop', () => {
     // second compaction; episode flags reset for later growth.
     await vi.waitFor(() => { expect(agent.status).toBe('idle') })
     expect(guardMessages(agent)).toHaveLength(2)
-    expect(compaction.compactNowCalls).toEqual([1])
+    expect(compaction!.compactNowCalls).toEqual([1])
     void ctx
   })
 
@@ -124,7 +125,7 @@ describe('context-guard full loop', () => {
     )
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(1) })
     expect(guardMessages(agent)).toEqual([])
-    expect(compaction.compactNowCalls).toEqual([])
+    expect(compaction!.compactNowCalls).toEqual([])
     expect(compactionEndCount(agent)).toBe(0)
     void ctx
   })
@@ -139,7 +140,7 @@ describe('context-guard full loop', () => {
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain('继续')
-    expect(compaction.compactNowCalls).toEqual([1])
+    expect(compaction!.compactNowCalls).toEqual([1])
     void ctx
   })
 })
@@ -150,7 +151,7 @@ describe('context-guard failure and configuration paths', () => {
       toolCallResponse('c1', 'probe', { q: 1 }),
       textResponse('wrapping up now'),
     ])
-    compaction.failNext = true
+    compaction!.failNext = true
     await vi.waitFor(() => { expect(compactionEndCount(agent)).toBe(1) })
     // The failure is contained: the wrap-up reminder still landed, but the
     // failed compaction opens no resume turn.
@@ -158,7 +159,7 @@ describe('context-guard failure and configuration paths', () => {
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain('收尾')
-    expect(compaction.compactNowCalls).toEqual([0])
+    expect(compaction!.compactNowCalls).toEqual([0])
     void ctx
   })
 
@@ -176,7 +177,7 @@ describe('context-guard failure and configuration paths', () => {
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain('继续')
-    expect(compaction.compactNowCalls).toEqual([1])
+    expect(compaction!.compactNowCalls).toEqual([1])
     void ctx
   })
 
@@ -193,7 +194,7 @@ describe('context-guard failure and configuration paths', () => {
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain('收尾')
-    expect(compaction.compactNowCalls).toEqual([1])
+    expect(compaction!.compactNowCalls).toEqual([1])
     void ctx
   })
 
@@ -209,8 +210,50 @@ describe('context-guard failure and configuration paths', () => {
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain('收尾')
-    expect(compaction.compactNowCalls).toEqual([])
+    expect(compaction!.compactNowCalls).toEqual([])
     expect(compactionEndCount(agent)).toBe(0)
+    void ctx
+  })
+
+  it('degrades gracefully when no compaction provider is mounted: reminder works, idle compact skipped', async () => {
+    const { ctx, agent, compaction } = await harness(
+      [
+        toolCallResponse('c1', 'probe', { q: 1 }),
+        textResponse('wrapping up now'),
+      ],
+      {},
+      300,
+      false,
+    )
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(1) })
+    // Hook 1 still lands without any compaction service.
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(1)
+    expect(messages[0]!.text).toContain('收尾')
+    // Hook 2 has no provider to call: no crash, no compaction events.
+    expect(compaction).toBeUndefined()
+    expect(compactionEndCount(agent)).toBe(0)
+    void ctx
+  })
+
+  it('an invalid thresholdRatio never throws: falls back to the default and keeps working', async () => {
+    const { ctx, agent, compaction } = await harness(
+      [
+        toolCallResponse('c1', 'probe', { q: 1 }),
+        textResponse('wrapping up now'),
+        textResponse('continuing'),
+      ],
+      { thresholdRatio: 2 },
+      300,
+      true,
+    )
+    // The plugin loaded (fallback 0.85) and the full loop still runs.
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(2)
+    expect(messages[0]!.text).toContain('收尾')
+    expect(messages[1]!.text).toContain('继续')
+    expect(compaction!.compactNowCalls).toEqual([1])
     void ctx
   })
 })

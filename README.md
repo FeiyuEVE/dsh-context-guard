@@ -22,7 +22,13 @@ durable in the session log and reconstructable (model-visible ⟺ logged).
 dsh plugin --profile web add /path/to/dsh-context-guard
 ```
 
-组合要求：插件注入 `compaction` 服务，组合中必须有压缩提供方（如 `@deepseek-ai/dsh-compaction-basic`）；缺失时插件保持 pending，启动失败（fail loud）。注意 web profile 的 web-app bundle 默认禁用 compaction-basic（压缩后端随 agent preset 组合提供），若你的部署如此，需要在会话组合中提供 `ctx.compaction`。
+bundle 采用 cost-meter 式单一 Loader 行（`cordis.patch.yml` 只 insert `context-guard` 一行），不干预 profile 的压缩后端配置。
+
+**容错设计（插件出错不影响 dsh 进程）**：
+
+- `compaction` 是可选服务（`ctx.get` 判空）：组合中没有提供方（如 web-app 默认把压缩后端留给 preset）时插件照常加载，hook 1（收尾提醒）可用，hook 2/3 降级并记录一次警告，**不会 pending、不会阻塞启动**。
+- 越界配置（如 `thresholdRatio: 2`）不抛错：记录 error 日志并回退默认值。
+- 所有监听器（`session/event`、`agent/pre-step`、`agent/status`、压缩续跑）的运行期异常均被包含并记日志，任何情况下都不向外抛出。
 
 ## 配置 / Config
 
@@ -71,7 +77,7 @@ npm run verify      # 三者全跑
 
 ## 已知限制 / Known Limitations
 
-- 强依赖 `compaction` 服务（fail loud，不静默降级）；组合中无提供方时插件不激活。
+- `compaction` 是可选服务（`ctx.get` 判空）：无提供方时 hook 2/3 降级（警告一次），hook 1 不受影响；bundle 默认随插件启用 `compaction-basic`。
 - `step/end` 评估依赖 `session.requestHeader()` 与模型适配器声明的 `contextWindow`；无请求头或模型未声明窗口时会话被跳过。
 - 收尾是「提示性停止」：通过提醒引导 agent 自行收尾停轮，不强制中断轮次。
 
