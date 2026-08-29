@@ -25,6 +25,51 @@ import { StubCompactionEngine } from './stub-compaction.ts'
 /** Long initial task text: ~440 heuristic tokens, over a 255-token threshold. */
 const TASK_TEXT = 'start '.repeat(350)
 
+/** Minimal fake settings provider serving the `context-guard` namespace. */
+type ThresholdSettingsValue = {
+  defaultThresholdTokens: number
+  providerThresholds: { provider: string; thresholdTokens: number }[]
+}
+interface FakeSettingsScope {
+  get(): ThresholdSettingsValue
+  watch(callback: (value: ThresholdSettingsValue) => void): () => void
+  update(patch: object): Promise<void>
+}
+function fakeSettings(initial: ThresholdSettingsValue): {
+  value: ThresholdSettingsValue
+  scope: FakeSettingsScope | undefined
+  provide(ctx: Context): void
+} {
+  const watchers = new Set<(value: ThresholdSettingsValue) => void>()
+  const state: {
+    value: ThresholdSettingsValue
+    scope: FakeSettingsScope | undefined
+    provide(ctx: Context): void
+  } = {
+    value: initial,
+    scope: undefined,
+    provide(ctx) {
+      ctx.provide('settings', {
+        register() {
+          state.scope = {
+            get: () => state.value,
+            watch: (callback: (value: ThresholdSettingsValue) => void) => {
+              watchers.add(callback)
+              return () => { watchers.delete(callback) }
+            },
+            update: async (patch: object) => {
+              state.value = { ...state.value, ...patch } as ThresholdSettingsValue
+              for (const watcher of watchers) watcher(state.value)
+            },
+          }
+          return state.scope
+        },
+      } as never)
+    },
+  }
+  return state
+}
+
 /**
  * Boot the core spine, the stub compaction backend, and the guard with a
  * scripted mock adapter, and start one over-threshold turn.
@@ -34,10 +79,12 @@ async function harness(
   config: Config = {},
   contextWindow = 300,
   withCompaction = true,
+  settings?: ReturnType<typeof fakeSettings>,
 ): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine | undefined; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   await ctx.plugin(TokenMeter)
+  settings?.provide(ctx)
   const compaction = withCompaction ? new StubCompactionEngine(ctx) : undefined
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(ContextGuard, config)
@@ -253,6 +300,94 @@ describe('context-guard failure and configuration paths', () => {
     expect(messages).toHaveLength(2)
     expect(messages[0]!.text).toContain('收尾')
     expect(messages[1]!.text).toContain('继续')
+    expect(compaction!.compactNowCalls).toEqual([1])
+    void ctx
+  })
+})
+
+describe('settings-provided absolute thresholds', () => {
+  it('uses the per-provider absolute token threshold: above it nothing fires, at it the loop runs', async () => {
+    // Task pressure ≈ 560 tokens incl. the system prompt (ratio fallback 255).
+    const high = fakeSettings({
+      defaultThresholdTokens: 0,
+      providerThresholds: [{ provider: 'mock', thresholdTokens: 600 }],
+    })
+    const first = await harness(
+      [textResponse('first turn')],
+      {},
+      300,
+      true,
+      high,
+    )
+    // 600 > ~560-token pressure: nothing fires, the turn settles clean.
+    await vi.waitFor(() => { expect(turnsEnded(first.agent)).toBe(1) })
+    expect(guardMessages(first.agent)).toEqual([])
+    expect(first.compaction!.compactNowCalls).toEqual([])
+    void first.ctx
+
+    const low = fakeSettings({
+      defaultThresholdTokens: 0,
+      providerThresholds: [{ provider: 'mock', thresholdTokens: 400 }],
+    })
+    const second = await harness(
+      [textResponse('first turn'), textResponse('continuing')],
+      {},
+      300,
+      true,
+      low,
+    )
+    // 400 <= ~560-token pressure: idle compaction + resume run the loop.
+    await vi.waitFor(() => { expect(turnsEnded(second.agent)).toBe(2) })
+    const messages = guardMessages(second.agent)
+    expect(messages).toHaveLength(1)
+    expect(messages[0]!.text).toContain('继续')
+    expect(second.compaction!.compactNowCalls).toEqual([1])
+    void second.ctx
+  })
+
+  it('uses the default absolute threshold for providers without an entry', async () => {
+    const settings = fakeSettings({
+      defaultThresholdTokens: 400,
+      providerThresholds: [],
+    })
+    const { ctx, agent, compaction } = await harness(
+      [textResponse('first turn'), textResponse('continuing')],
+      {},
+      300,
+      true,
+      settings,
+    )
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(1)
+    expect(messages[0]!.text).toContain('继续')
+    expect(compaction!.compactNowCalls).toEqual([1])
+    void ctx
+  })
+
+  it('applies settings updates live through watch: a lowered threshold takes effect on the next turn', async () => {
+    const settings = fakeSettings({
+      defaultThresholdTokens: 1000,
+      providerThresholds: [],
+    })
+    const { ctx, agent, compaction } = await harness(
+      [textResponse('first turn'), textResponse('second turn'), textResponse('continuing')],
+      {},
+      300,
+      true,
+      settings,
+    )
+    // Above 1000 nothing fires; the first turn settles clean.
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(1) })
+    expect(guardMessages(agent)).toEqual([])
+
+    // Lower the default threshold below the ~560-token pressure.
+    await settings.scope!.update({ defaultThresholdTokens: 100 })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go on' }], source: { kind: 'user' } }))
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(3) })
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(1)
+    expect(messages[0]!.text).toContain('继续')
     expect(compaction!.compactNowCalls).toEqual([1])
     void ctx
   })

@@ -30,9 +30,11 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
-// Type-only: pulls in the `ctx.compaction` / `ctx.tokenMeter` declaration merges.
+// Type-only: pulls in the `ctx.compaction` / `ctx.tokenMeter` / `ctx.settings`
+// declaration merges.
 import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-token-meter'
+import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 
 export const name = 'context-guard'
 
@@ -100,12 +102,52 @@ const RESUME_SUMMARY = '上下文已压缩，已恢复任务'
 
 /** Request pressure relative to the routed model's context capacity. */
 interface Pressure {
+  /** The routed provider route. */
+  provider: string
   /** Token-meter request pressure of the whole session surface. */
   totalTokens: number
   /** The routed model's declared combined request-and-response window. */
   contextWindow: number
   /** `totalTokens / contextWindow`. */
   ratio: number
+}
+
+/**
+ * Settings-provided absolute thresholds (in tokens) per provider route. The
+ * `context-guard` settings namespace lets the web UI configure these; values
+ * are merged over the config's percentage fallback. `0` means "not set".
+ */
+interface ThresholdOverrides {
+  /** Global absolute threshold applied to every provider without an entry. */
+  defaultTokens: number
+  /** Per-provider absolute thresholds, keyed by provider route id. */
+  providerTokens: Map<string, number>
+}
+
+/** The settings namespace value: absolute token thresholds per provider. */
+interface ThresholdSettingsValue {
+  /** Global absolute threshold applied to every provider without an entry; `0` means unset. */
+  defaultThresholdTokens: number
+  /** Per-provider absolute thresholds, keyed by provider route id. */
+  providerThresholds: { provider: string; thresholdTokens: number }[]
+}
+
+/** The settings namespace schema: absolute token thresholds per provider. */
+const settingsSchema: z<ThresholdSettingsValue> = z.object({
+  defaultThresholdTokens: z.number().step(1).min(0).default(0),
+  providerThresholds: z.array(z.object({
+    provider: z.string().required(),
+    thresholdTokens: z.number().step(1).min(1).required(),
+  })).default([]),
+})
+
+/** Extract the live threshold overrides from a resolved settings value. */
+function overridesOf(value: ThresholdSettingsValue): ThresholdOverrides {
+  const providerTokens = new Map<string, number>()
+  for (const entry of value.providerThresholds) {
+    providerTokens.set(entry.provider, entry.thresholdTokens)
+  }
+  return { defaultTokens: value.defaultThresholdTokens, providerTokens }
 }
 
 /** One session's over-threshold episode state; entries are GC'd with the session. */
@@ -141,6 +183,33 @@ export function apply(ctx: Context, config: Config = {}): void {
       `context-guard: invalid thresholdRatio ${thresholdRatio} — must be a finite number in [0, 1]; using default 0.85`,
     )
     thresholdRatio = 0.85
+  }
+
+  // The settings seam is optional: without a provider the guard falls back to
+  // the config's percentage ratio. Registration failures are contained so a
+  // settings misconfiguration can never take the host down.
+  let thresholds: ThresholdOverrides | undefined
+  const settings = ctx.get('settings')
+  if (settings !== undefined) {
+    try {
+      const scope = settings.register(settingsNamespace('context-guard'), settingsSchema)
+      const sync = (): void => { thresholds = overridesOf(scope.get()) }
+      sync()
+      scope.watch(sync)
+    } catch (error: unknown) {
+      ctx.logger.warn(`context-guard: settings registration failed: ${String(error)}`)
+    }
+  }
+
+  /**
+   * The absolute token threshold in force for one provider route: the
+   * per-provider settings entry, else the settings default, else the config
+   * percentage ratio converted against the model's context window.
+   */
+  function thresholdTokensFor(provider: string, contextWindow: number): number {
+    const overrides = thresholds
+    const explicit = overrides?.providerTokens.get(provider) ?? overrides?.defaultTokens ?? 0
+    return explicit > 0 ? explicit : Math.round(contextWindow * thresholdRatio)
   }
 
   const states = new WeakMap<Session, EpisodeState>()
@@ -182,7 +251,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     const contextWindow = info.context?.contextWindow
     if (contextWindow === undefined) return undefined
     const totalTokens = ctx.tokenMeter.measure(agent.session).totalTokens
-    return { totalTokens, contextWindow, ratio: totalTokens / contextWindow }
+    return { provider, totalTokens, contextWindow, ratio: totalTokens / contextWindow }
   }
 
   /**
@@ -202,7 +271,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   async function evaluateStepEnd(agent: Agent, turn: number, step: number, state: EpisodeState): Promise<void> {
     const pressure = await measurePressure(agent)
     if (pressure === undefined) return
-    if (pressure.ratio < thresholdRatio) {
+    if (pressure.totalTokens < thresholdTokensFor(pressure.provider, pressure.contextWindow)) {
       state.warned = false
       state.compacted = false
       state.pendingReminder = undefined
@@ -216,8 +285,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     })
     state.warned = true
     ctx.logger.info(
-      `context-guard: ${agent.id} at ${Math.round(pressure.ratio * 100)}% of `
-      + `${pressure.contextWindow}-token context; queued wrap-up reminder`,
+      `context-guard: ${agent.id} at ${pressure.totalTokens} of `
+      + `${thresholdTokensFor(pressure.provider, pressure.contextWindow)}-token threshold `
+      + `(${Math.round(pressure.ratio * 100)}% of ${pressure.contextWindow}); queued wrap-up reminder`,
     )
   }
 
@@ -303,7 +373,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     try {
       const pressure = await measurePressure(agent)
       if (pressure === undefined) return
-      if (pressure.ratio < thresholdRatio) {
+      if (pressure.totalTokens < thresholdTokensFor(pressure.provider, pressure.contextWindow)) {
         state.warned = false
         state.compacted = false
         return
@@ -324,8 +394,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (result !== null) {
         state.compacted = true
         ctx.logger.info(
-          `context-guard: ${agent.id} idle at ${Math.round(pressure.ratio * 100)}% of `
-          + `${pressure.contextWindow}-token context; compacted ${result.shadowedSeqs.length} surface nodes`,
+          `context-guard: ${agent.id} idle at ${pressure.totalTokens} of `
+          + `${thresholdTokensFor(pressure.provider, pressure.contextWindow)}-token threshold `
+          + `(${Math.round(pressure.ratio * 100)}% of ${pressure.contextWindow}); `
+          + `compacted ${result.shadowedSeqs.length} surface nodes`,
         )
       }
     } catch (error: unknown) {

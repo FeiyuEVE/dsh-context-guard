@@ -9,11 +9,17 @@
       "types": "./lib/index.d.mts",
       "default": "./lib/index.mjs"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": {
+      "default": "./lib/client.js"
+    }
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "files": [
@@ -44,7 +50,8 @@
     "@types/node": "^24.3.0",
     "tsdown": "^0.22.14",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "esbuild": "^0.28.1"
   },
   "repository": {
     "type": "git",
@@ -65,9 +72,10 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsdown",
+    "build": "npm run build:client && tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "verify": "npm run typecheck && npm run test && npm run build"
+    "verify": "npm run typecheck && npm run test && npm run build",
+    "build:client": "node scripts/build.mjs"
   }
 }

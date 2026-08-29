@@ -4,6 +4,15 @@ DeepSeek Harness 上下文压力守卫插件：监控会话上下文占用，超
 
 Context-pressure guard plugin for DeepSeek Harness: watches session context usage, reminds the agent to wrap up above a threshold, compacts over-threshold idle sessions, and resumes the task after a completed compaction.
 
+## 设置面板（Web UI）/ Settings UI
+
+插件带浏览器端分节（settings.section「压缩阈值」）：**按供应商（provider）配置绝对 token 阈值**（如 `300000`），保存即生效（host 侧实时 watch）。配置项：
+
+- **默认阈值（tokens）**：未单独配置的供应商使用；
+- **供应商阈值**：按 provider 覆盖默认值。
+
+判定优先级：`供应商阈值 > 默认阈值 > 插件配置的百分比（thresholdRatio × contextWindow）`。设置存储在 dsh settings（`context-guard` 命名空间，settings-file 持久化）。
+
 ## 功能 / Features
 
 三个 hook 组成一个闭环（每个会话独立）：
@@ -34,7 +43,7 @@ bundle 采用 cost-meter 式单一 Loader 行（`cordis.patch.yml` 只 insert `c
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `thresholdRatio` | number (0–1) | `0.85` | 上下文占用（`totalTokens / contextWindow`）超过该比例即触发 |
+| `thresholdRatio` | number (0–1) | `0.85` | 回退阈值：settings 未配置绝对阈值时按 `占用 / contextWindow` 触发 |
 | `wrapUpPrompt` | string | 中文收尾提醒 | 步骤结束时注入的收尾提示；空字符串禁用 hook 1 |
 | `resumePrompt` | string | 中文续跑提示 | 压缩成功后注入的续跑提示；空字符串禁用 hook 3 |
 | `autoCompactOnIdle` | boolean | `true` | 空闲且超阈值时自动压缩（hook 2 开关） |
