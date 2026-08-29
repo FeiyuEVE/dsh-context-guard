@@ -34,7 +34,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-session'
 // declaration merges.
 import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-token-meter'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 
 export const name = 'context-guard'
 
@@ -132,6 +132,12 @@ interface ThresholdSettingsValue {
   providerThresholds: { provider: string; thresholdTokens: number }[]
 }
 
+/** The composition fallback: no settings layer configured means every value unset. */
+const EMPTY_THRESHOLDS: ThresholdSettingsValue = {
+  defaultThresholdTokens: 0,
+  providerThresholds: [],
+}
+
 /** The settings namespace schema: absolute token thresholds per provider. */
 const settingsSchema: z<ThresholdSettingsValue> = z.object({
   defaultThresholdTokens: z.number().step(1).min(0).default(0),
@@ -186,20 +192,18 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   // The settings seam is optional: without a provider the guard falls back to
-  // the config's percentage ratio. Registration failures are contained so a
-  // settings misconfiguration can never take the host down.
+  // the config's percentage ratio. Registration uses the official
+  // installSettingsSection helper, which waits for the settings service via
+  // ctx.inject (declarative, retried on service changes) rather than reading
+  // ctx.get('settings') once at apply time — the eager read could run before
+  // the settings provider finished loading and silently skip registration
+  // forever. The composition entry (no base layer) is the fallback source.
   let thresholds: ThresholdOverrides | undefined
-  const settings = ctx.get('settings')
-  if (settings !== undefined) {
-    try {
-      const scope = settings.register(settingsNamespace('context-guard'), settingsSchema)
-      const sync = (): void => { thresholds = overridesOf(scope.get()) }
-      sync()
-      scope.watch(sync)
-    } catch (error: unknown) {
-      ctx.logger.warn(`context-guard: settings registration failed: ${String(error)}`)
-    }
-  }
+  let settingsSource: () => ThresholdSettingsValue = () => EMPTY_THRESHOLDS
+  installSettingsSection(ctx, settingsNamespace('context-guard'), settingsSchema, EMPTY_THRESHOLDS, {
+    setSource: (current) => { settingsSource = current },
+    onChange: () => { thresholds = overridesOf(settingsSource()) },
+  })
 
   /**
    * The absolute token threshold in force for one provider route: the
