@@ -8,9 +8,9 @@
  *  - 默认阈值：所有未单独配置的供应商生效；
  *  - 供应商阈值：按 provider 覆盖默认值。
  *
- * 供应商列表直接来自 dsh 的 LLM 目录（remote.llm.listProviders() 与
- * listConfigurableProviders() 合并，与官方 Models 设置页同一数据源），
- * 用户从下拉框选择而非手输；llm remote 不可用时降级为手输文本框。
+ * 供应商列表直接来自 dsh 的 LLM 目录（remote.llm.listProviders()，即当前
+ * 实际注册/激活的提供方），用户从下拉框选择而非手输；llm remote 不可用时
+ * 降级为手输文本框。
  *
  * 数据通道：remote.settings.*（settings Host Remote）读写 host 侧注册的
  * `context-guard` settings 命名空间；host 插件实时 watch，保存即生效。
@@ -73,23 +73,13 @@ window.__ModuleLoader__.load({
     ].join('\n')
 
     /**
-     * 合并 LLM 目录：已注册提供方（listProviders）与可配置提供方目录
-     * （listConfigurableProviders）去重，目录条目优先提供显示名。
+     * 供应商下拉的来源：当前已注册（激活）的提供方（listProviders）。
+     * 不合并可配置目录（listConfigurableProviders）——那会列出所有未配置
+     * 的候选路由，用户只需看到当前 dsh 实际在用的那一个。
      * @returns {{ provider: string, displayName: string }[]}
      */
-    function joinProviders(registered, declared) {
-      const rows = []
-      const seen = new Set()
-      for (const entry of declared) {
-        rows.push({ provider: entry.provider, displayName: entry.displayName })
-        seen.add(entry.provider)
-      }
-      for (const info of registered) {
-        if (seen.has(info.id)) continue
-        rows.push({ provider: info.id, displayName: info.name })
-        seen.add(info.id)
-      }
-      return rows
+    function registeredProviders(registered) {
+      return (registered ?? []).map(info => ({ provider: info.id, displayName: info.name }))
     }
 
     /** 设置分节表单：默认阈值 + 按供应商的绝对 token 阈值。 */
@@ -102,17 +92,14 @@ window.__ModuleLoader__.load({
       const [revision, setRevision] = useState(undefined)
       const [status, setStatus] = useState(null)
 
-      // 供应商目录来自 dsh LLM 目录（与 Models 设置页同一数据源）。
+      // 供应商列表 = 当前已注册（激活）的提供方（listProviders），不合并
+      // 可配置目录，避免把未配置的候选路由（如 llm-pi-ai 的几十个）列进来。
       const loadProviders = useCallback(async () => {
         if (llm === undefined || typeof llm.listProviders !== 'function') return
         try {
-          const [registered, declared] = await Promise.all([
-            llm.listProviders(),
-            llm.listConfigurableProviders(),
-          ])
+          const registered = await llm.listProviders()
           if (!registered.ok) throw new Error(registered.error?.message ?? 'listProviders failed')
-          if (!declared.ok) throw new Error(declared.error?.message ?? 'listConfigurableProviders failed')
-          setProviders(joinProviders(registered.value ?? [], declared.value ?? []))
+          setProviders(registeredProviders(registered.value))
           setProviderError(null)
         } catch (error) {
           setProviderError(T.providersFailed + String(error?.message ?? error))
