@@ -73,6 +73,10 @@ function fakeSettings(initial: ThresholdSettingsValue): {
 /**
  * Boot the core spine, the stub compaction backend, and the guard with a
  * scripted mock adapter, and start one over-threshold turn.
+ * @param presets - optional seam factory: receives the harness context and
+ *   returns an `agentPresets`-shaped service (or undefined). Mirrors the real
+ *   topology where the guard is a host row and the compaction provider lives
+ *   in the agent's preset realm, reachable only through this seam.
  */
 async function harness(
   script: ScriptEntry[],
@@ -80,11 +84,14 @@ async function harness(
   contextWindow = 300,
   withCompaction = true,
   settings?: ReturnType<typeof fakeSettings>,
+  presets?: (ctx: Context) => { serviceFor(agent: { ctx: Context }, name: string): unknown } | undefined,
 ): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine | undefined; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   await ctx.plugin(TokenMeter)
   settings?.provide(ctx)
+  const presetsValue = presets?.(ctx)
+  if (presetsValue !== undefined) ctx.provide('agentPresets', presetsValue as never)
   const compaction = withCompaction ? new StubCompactionEngine(ctx) : undefined
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(ContextGuard, config)
@@ -188,6 +195,48 @@ describe('context-guard full loop', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain('继续')
     expect(compaction!.compactNowCalls).toEqual([1])
+    void ctx
+  })
+
+  it('reaches a realm-private compaction provider through the agentPresets seam', async () => {
+    // Real web topology: the guard is a host row while the preset mounts the
+    // compaction backend behind `isolate: { compaction: true }`, which the
+    // host fiber cannot see. The provider is registered in an isolate realm
+    // (cordis `ctx.isolate`), and the guard finds it only through the
+    // agentPresets seam — the documented read path for exactly this case.
+    const serviceForCalls: string[] = []
+    const realm: { compaction: StubCompactionEngine | undefined } = { compaction: undefined }
+    const { ctx, agent } = await harness(
+      [
+        toolCallResponse('c1', 'probe', { q: 1 }),
+        textResponse('wrapping up now'),
+        textResponse('continuing after compaction'),
+      ],
+      {},
+      300,
+      false, // no host-plane provider: the realm instance is the only one
+      undefined,
+      (ctx) => {
+        realm.compaction = new StubCompactionEngine(ctx.isolate('compaction'))
+        return {
+          serviceFor: (_target, name) => {
+            serviceForCalls.push(name)
+            return name === 'compaction' ? realm.compaction : undefined
+          },
+        }
+      },
+    )
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+
+    // The full warn → compact → resume loop ran, with the realm instance
+    // reached through exactly one seam lookup.
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(2)
+    expect(messages[0]!.text).toContain('收尾')
+    expect(messages[1]!.text).toContain('继续')
+    expect(serviceForCalls).toEqual(['compaction'])
+    expect(realm.compaction!.compactNowCalls).toEqual([1])
+    expect(compactionEndCount(agent)).toBe(1)
     void ctx
   })
 })

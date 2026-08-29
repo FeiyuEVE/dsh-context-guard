@@ -11,8 +11,11 @@
  *    messages, so the model sees it before its very next action and wraps the
  *    turn up instead of extending it.
  * 2. `agent/status` idle — when the agent stops and the session is still over
- *    the threshold, the guard runs `ctx.compaction.compactNow()` once per
- *    over-threshold episode.
+ *    the threshold, the guard runs `compaction.compactNow()` once per
+ *    over-threshold episode. The engine is resolved per agent: a host-plane
+ *    provider first, else the instance the agent's preset mounted behind its
+ *    `isolate` realm (via the `agentPresets` seam), so preset-owned backends
+ *    are reachable from this host-mounted guard.
  * 3. `compaction/end` — after a successful compaction of an idle agent, the
  *    guard queues a continuation prompt and wakes the driver, so the task
  *    resumes on the compacted surface instead of sitting idle.
@@ -136,6 +139,16 @@ interface ThresholdSettingsValue {
 const EMPTY_THRESHOLDS: ThresholdSettingsValue = {
   defaultThresholdTokens: 0,
   providerThresholds: [],
+}
+
+/**
+ * The one `agentPresets` seam method the guard reads: the service instance an
+ * agent's preset mounted behind an `isolate` realm. Such an instance is
+ * invisible to every context outside the preset group — including the host
+ * fiber this guard runs on — so the seam is the supported read path for it.
+ */
+interface PresetServiceSeam {
+  serviceFor<K extends string & keyof Context>(agent: { ctx: Context }, name: K): Context[K] | undefined
 }
 
 /** The settings namespace schema: absolute token thresholds per provider. */
@@ -383,10 +396,18 @@ export function apply(ctx: Context, config: Config = {}): void {
         return
       }
       if (!autoCompactOnIdle || state.compacted) return
-      // Compaction is an optional service: web compositions may leave it to
-      // their agent presets, so a missing provider degrades hooks 2/3 (with
-      // the wrap-up reminder still active) instead of blocking boot.
+      // Compaction is an optional service, and where it lives depends on the
+      // composition. Web profiles keep it preset-owned: `compaction-basic`
+      // mounts behind the preset's `isolate` realm, invisible to the host
+      // fiber this guard runs on, so the host lookup alone misses every
+      // preset composition. The agentPresets seam is the supported read path
+      // for exactly that case — the instance the agent's own composition
+      // mounted. Host-plane providers (tests, non-preset compositions)
+      // resolve through `ctx.get` first. A missing provider degrades hooks
+      // 2/3 (with the wrap-up reminder still active) instead of blocking
+      // boot.
       const compaction = ctx.get('compaction')
+        ?? (ctx.get('agentPresets') as PresetServiceSeam | undefined)?.serviceFor(agent, 'compaction')
       if (compaction === undefined) {
         if (!warnedNoProvider) {
           warnedNoProvider = true

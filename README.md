@@ -18,7 +18,7 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 三个 hook 组成一个闭环（每个会话独立）：
 
 1. **hook `step/end`** — 步骤结束时评估会话上下文（`tokenMeter` 测量 / 路由模型的 `contextWindow`）。超过 `thresholdRatio` 且该步骤仍欠模型一次请求（assistant 消息带工具调用）时，把「尽快收尾」提醒折叠进下一步的进入消息，agent 看到后收尾并停轮；同一个超阈值周期只提醒一次。
-2. **hook `agent/status` idle** — agent 停下后再次评估；仍超阈值则执行 `ctx.compaction.compactNow()`，每个超阈值周期只压缩一次（防止压缩-续跑死循环）。
+2. **hook `agent/status` idle** — agent 停下后再次评估；仍超阈值则执行 `compaction.compactNow()`（引擎解析见下文「容错设计」），每个超阈值周期只压缩一次（防止压缩-续跑死循环）。
 3. **hook `compaction/end`** — 压缩成功（无 `error`）且 agent 空闲时，注入「继续执行任务」提示并 `followup()` 唤醒，在压缩后的表层上续跑。失败或 agent 运行中不续跑。
 
 All injected content is a user-role message stamped with the plugin source
@@ -35,7 +35,7 @@ bundle 采用 cost-meter 式单一 Loader 行（`cordis.patch.yml` 只 insert `c
 
 **容错设计（插件出错不影响 dsh 进程）**：
 
-- `compaction` 是可选服务（`ctx.get` 判空）：组合中没有提供方（如 web-app 默认把压缩后端留给 preset）时插件照常加载，hook 1（收尾提醒）可用，hook 2/3 降级并记录一次警告，**不会 pending、不会阻塞启动**。
+- `compaction` 是可选服务，按 agent 解析：先查 host 平面的提供方（`ctx.get`），否则经 `agentPresets` seam 读取该 agent 的 preset 在 `isolate` realm 中挂载的实例（标准/ptc/cordis preset 都把 `compaction-basic` 放在 `isolate: { compaction: true }` 后面，host 光纤看不到，只能走 seam）。两层都没有时插件照常加载，hook 1（收尾提醒）可用，hook 2/3 降级并记录一次警告，**不会 pending、不会阻塞启动**。
 - 越界配置（如 `thresholdRatio: 2`）不抛错：记录 error 日志并回退默认值。
 - 所有监听器（`session/event`、`agent/pre-step`、`agent/status`、压缩续跑）的运行期异常均被包含并记日志，任何情况下都不向外抛出。
 
@@ -86,7 +86,7 @@ npm run verify      # 三者全跑
 
 ## 已知限制 / Known Limitations
 
-- `compaction` 是可选服务（`ctx.get` 判空）：无提供方时 hook 2/3 降级（警告一次），hook 1 不受影响；bundle 默认随插件启用 `compaction-basic`。
+- `compaction` 是可选服务，按 agent 解析（host 平面 `ctx.get` → preset realm `agentPresets.serviceFor`）：两层都没有提供方时 hook 2/3 降级（警告一次），hook 1 不受影响；preset 自带的 `compaction-basic` 位于 `isolate` realm，host 行只能经 seam 访问。
 - `step/end` 评估依赖 `session.requestHeader()` 与模型适配器声明的 `contextWindow`；无请求头或模型未声明窗口时会话被跳过。
 - 收尾是「提示性停止」：通过提醒引导 agent 自行收尾停轮，不强制中断轮次。
 
