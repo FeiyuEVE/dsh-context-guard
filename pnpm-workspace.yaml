@@ -1,0 +1,21 @@
+# 与工作区 deepseek-harness 同版本（0.1.2-alpha.1，尚未发布到 npm）：
+# 本地安装把 dsh 依赖重定向到工作区源码目录（link: 符号链接，依赖从工作区
+# 包自身的 node_modules 解析，避免 file: 拉入 workspace: 协议的传递依赖）。
+# cordis / schemastery 同样重定向到工作区 vendor 副本：本地 dsh 包的类型增强
+# （declare module '@deepseek-ai/cordis'）与运行时 Service 身份都以 vendor
+# 副本为准，若用 registry 副本会出现双份实例（类型增强失效、服务身份割裂）。
+overrides:
+  '@deepseek-ai/cordis': 'link:../deepseek-harness/vendor/cordis'
+  '@deepseek-ai/schemastery': 'link:../deepseek-harness/vendor/schemastery'
+  '@deepseek-ai/dsh-agent': 'link:../deepseek-harness/packages/core/agent'
+  '@deepseek-ai/dsh-agent-loop': 'link:../deepseek-harness/packages/core/agent-loop'
+  '@deepseek-ai/dsh-agent-loop-testkit': 'link:../deepseek-harness/packages/test-support/agent-loop-testkit'
+  '@deepseek-ai/dsh-compaction': 'link:../deepseek-harness/packages/compaction/compaction'
+  '@deepseek-ai/dsh-llm': 'link:../deepseek-harness/packages/llm/llm'
+  '@deepseek-ai/dsh-session': 'link:../deepseek-harness/packages/core/session'
+  '@deepseek-ai/dsh-token-meter': 'link:../deepseek-harness/packages/llm/token-meter'
+  '@deepseek-ai/dsh-settings': 'link:../deepseek-harness/packages/settings/settings'
+  '@deepseek-ai/dsh-tools': 'link:../deepseek-harness/packages/core/tools'
+
+allowBuilds:
+  esbuild: true
