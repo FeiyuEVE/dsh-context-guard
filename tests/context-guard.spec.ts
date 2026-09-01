@@ -14,6 +14,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import * as ContextGuard from '../src/index.ts'
@@ -88,6 +89,7 @@ async function harness(
 ): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine | undefined; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(TokenMeter)
   settings?.provide(ctx)
   const presetsValue = presets?.(ctx)
@@ -110,7 +112,7 @@ async function harness(
 
 /** All context-guard plugin-source user messages, in log order. */
 function guardMessages(agent: Agent): { text: string; seq: number }[] {
-  return [...agent.session.events]
+  return [...agent.session.snapshotEvents()]
     .filter((e): e is SessionEvent<'user/message'> =>
       e.type === 'user/message'
       && e.data.source.kind === 'plugin'
@@ -122,16 +124,16 @@ function guardMessages(agent: Agent): { text: string; seq: number }[] {
 }
 
 function turnCount(agent: Agent): number {
-  return agent.session.events.filter(e => e.type === 'turn/start').length
+  return agent.session.snapshotEvents().filter(e => e.type === 'turn/start').length
 }
 
 /** Completed turns: the durable signal that a turn fully settled. */
 function turnsEnded(agent: Agent): number {
-  return agent.session.events.filter(e => e.type === 'turn/end').length
+  return agent.session.snapshotEvents().filter(e => e.type === 'turn/end').length
 }
 
 function compactionEndCount(agent: Agent): number {
-  return agent.session.events.filter(e => e.type === 'compaction/end').length
+  return agent.session.snapshotEvents().filter(e => e.type === 'compaction/end').length
 }
 
 describe('context-guard full loop', () => {
@@ -149,7 +151,7 @@ describe('context-guard full loop', () => {
     expect(messages).toHaveLength(2)
     expect(messages[0]!.text).toContain('收尾')
     const wrapUpSeq = messages[0]!.seq
-    const wrapUpResponse = [...agent.session.events].find(e =>
+    const wrapUpResponse = [...agent.session.snapshotEvents()].find(e =>
       e.type === 'assistant/message'
       && e.data.message.content.some(b => b.type === 'text' && b.text === 'wrapping up now'))
     expect(wrapUpResponse).toBeDefined()

@@ -37,7 +37,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-session'
 // declaration merges.
 import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-token-meter'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 
 export const name = 'context-guard'
 
@@ -205,17 +205,27 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   // The settings seam is optional: without a provider the guard falls back to
-  // the config's percentage ratio. Registration uses the official
-  // installSettingsSection helper, which waits for the settings service via
-  // ctx.inject (declarative, retried on service changes) rather than reading
-  // ctx.get('settings') once at apply time — the eager read could run before
-  // the settings provider finished loading and silently skip registration
-  // forever. The composition entry (no base layer) is the fallback source.
+  // the config's percentage ratio. Registration waits on the settings service
+  // via ctx.inject (declarative, retried on service changes) rather than
+  // reading ctx.get('settings') once at apply time — the eager read could run
+  // before the settings provider finished loading and silently skip
+  // registration forever. The composition entry (no base layer) is the
+  // fallback source.
   let thresholds: ThresholdOverrides | undefined
   let settingsSource: () => ThresholdSettingsValue = () => EMPTY_THRESHOLDS
-  installSettingsSection(ctx, settingsNamespace('context-guard'), settingsSchema, EMPTY_THRESHOLDS, {
-    setSource: (current) => { settingsSource = current },
-    onChange: () => { thresholds = overridesOf(settingsSource()) },
+  ctx.inject(['settings'], (settingsCtx) => {
+    // register + watch 组合: 不依赖 SettingsProvider 实例方法(installSection)
+    // 的 this.ctx, 便于宿主组合与测试桩都可用。
+    const scope = settingsCtx.settings.register('context-guard', settingsSchema, {
+      base: EMPTY_THRESHOLDS,
+    })
+    settingsSource = () => scope.get()
+    thresholds = overridesOf(settingsSource())
+    scope.watch(() => { thresholds = overridesOf(settingsSource()) })
+    settingsCtx.effect(() => () => {
+      settingsSource = () => EMPTY_THRESHOLDS
+      thresholds = undefined
+    }, 'context-guard settings source')
   })
 
   /**
@@ -278,7 +288,7 @@ export function apply(ctx: Context, config: Config = {}): void {
    * compaction owns recovery.
    */
   function stepOwesMoreWork(session: Session, turn: number, step: number): boolean {
-    const message = session.events.findLast((event): event is SessionEvent<'assistant/message'> =>
+    const message = session.snapshotEvents().findLast((event): event is SessionEvent<'assistant/message'> =>
       event.type === 'assistant/message' && event.data.turn === turn && event.data.step === step)
     return message !== undefined
       && message.data.message.content.some(block => block.type === 'tool-call')

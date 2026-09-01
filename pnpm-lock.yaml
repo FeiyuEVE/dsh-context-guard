@@ -15,6 +15,7 @@ overrides:
   '@deepseek-ai/dsh-session': link:../deepseek-harness/packages/core/session
   '@deepseek-ai/dsh-token-meter': link:../deepseek-harness/packages/llm/token-meter
   '@deepseek-ai/dsh-settings': link:../deepseek-harness/packages/settings/settings
+  '@deepseek-ai/dsh-session-projection': link:../deepseek-harness/packages/session/session-projection
   '@deepseek-ai/dsh-tools': link:../deepseek-harness/packages/core/tools
 
 importers:
@@ -52,6 +53,9 @@ importers:
       '@deepseek-ai/dsh-agent-loop-testkit':
         specifier: link:../deepseek-harness/packages/test-support/agent-loop-testkit
         version: link:../deepseek-harness/packages/test-support/agent-loop-testkit
+      '@deepseek-ai/dsh-session-projection':
+        specifier: link:../deepseek-harness/packages/session/session-projection
+        version: link:../deepseek-harness/packages/session/session-projection
       '@deepseek-ai/dsh-tools':
         specifier: link:../deepseek-harness/packages/core/tools
         version: link:../deepseek-harness/packages/core/tools
