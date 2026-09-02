@@ -72,14 +72,22 @@ export interface Config {
   resumeAfterCompact?: boolean
 }
 
-/** Default wrap-up reminder: finish the current task, do not start new work. */
+/**
+ * Default wrap-up reminder: finish the current task, write an optional handoff
+ * note, and close the turn with a self-contained recap — the context is about
+ * to be cut down to that recap plus an archival pointer frame.
+ */
 const DEFAULT_WRAP_UP_PROMPT =
-  '当前会话上下文已接近模型上下文窗口上限。请立即收尾：不要启动新的子任务或继续深入探索，'
-  + '只完成当前任务尚未完成的最后一步，给出最终结论并停止。'
+  '当前会话上下文已接近上限，即将被截断为「本回复 + 归档指针」。请立即收尾：\n'
+  + '1) 若任务尚未完成，把关键状态写入工作区 .handoff/ 目录下的一个 md 文件'
+  + '（涉及的文件路径、已做决策、未完成项、下一步），文件名自定，并在下面的接力总结中给出该路径；\n'
+  + '2) 在回复末尾输出一段 ≤200 字、自包含的接力总结（截断后它将是上下文里唯一的对话帧）；\n'
+  + '3) 不要启动新的子任务或继续深入探索，完成后停止。'
 
 /** Default continuation prompt: keep going after the compaction. */
 const DEFAULT_RESUME_PROMPT =
-  '上下文压缩已完成。请继续执行压缩前正在进行的任务，直到任务完成。'
+  '上下文已压缩并归档（摘要帧中包含归档 md 的路径）。需要细节时用 read 工具按需读取该文件恢复状态，'
+  + '然后继续执行压缩前正在进行的任务，直到任务完成。'
 
 export const Config: z<Config> = z.object({
   // Unbounded on purpose: an out-of-range ratio is normalized in apply (with

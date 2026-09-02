@@ -1,8 +1,9 @@
 import { defineConfig } from 'tsdown'
 
-/** Bundle the single host entry; types come from the tsc pass. */
+/** Bundle the host entries (guard + archive-cut compaction backend); types
+ * come from the tsc pass. */
 export default defineConfig({
-  entry: ['src/index.ts'],
+  entry: ['src/index.ts', 'src/compaction.ts'],
   outDir: 'lib',
   format: ['esm'],
   platform: 'node',
