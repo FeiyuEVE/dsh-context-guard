@@ -49,8 +49,16 @@ export class StubCompactionEngine extends CompactionEngine {
     return agent.runMaintenance(async () => {
       const session = agent.session
       const surface = session.surface.nodes
-      if (surface.length < 2) return null
-      const shadowedSeqs = surface.slice(0, 2)
+      // A `system/message` at surface node 0 is never inside a compaction
+      // range: session surface validation refuses a replacement that shadows
+      // the system prompt unless the replacing event is a `system/message`
+      // over exactly that node, and the real backend therefore starts past it.
+      // Without a system head the range starts at node 0.
+      const headSeq = surface[0]
+      const head = headSeq === undefined ? undefined : session.eventAt(headSeq)
+      const firstIdx = head?.type === 'system/message' ? 1 : 0
+      if (surface.length < firstIdx + 2) return null
+      const shadowedSeqs = surface.slice(firstIdx, firstIdx + 2)
       const start = shadowedSeqs[0]!
       const end = shadowedSeqs[1]!
       const compactionId = CompactionId(`stub-${this.compactNowCalls.length}`)
@@ -71,7 +79,7 @@ export class StubCompactionEngine extends CompactionEngine {
         content: summary,
         source: compactCheckpointSource(compactionId),
       }), {
-        surfaceOp: { op: 'replace', start, end },
+        surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
         sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
       })
       if (fail) {

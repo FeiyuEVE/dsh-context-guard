@@ -11,6 +11,7 @@ overrides:
   '@deepseek-ai/dsh-agent-loop': 'link:../deepseek-harness/packages/core/agent-loop'
   '@deepseek-ai/dsh-agent-loop-testkit': 'link:../deepseek-harness/packages/test-support/agent-loop-testkit'
   '@deepseek-ai/dsh-compaction': 'link:../deepseek-harness/packages/compaction/compaction'
+  '@deepseek-ai/dsh-compaction-basic': 'link:../deepseek-harness/packages/compaction/compaction-basic'
   '@deepseek-ai/dsh-llm': 'link:../deepseek-harness/packages/llm/llm'
   '@deepseek-ai/dsh-session': 'link:../deepseek-harness/packages/core/session'
   '@deepseek-ai/dsh-token-meter': 'link:../deepseek-harness/packages/llm/token-meter'

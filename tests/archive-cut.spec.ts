@@ -19,10 +19,9 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
-import type { Message } from '@deepseek-ai/dsh-llm'
+import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
 import { messagesToMarkdown } from '../src/messages-to-md.ts'
 import ArchiveCutEngine from '../src/compaction.ts'
 import * as ContextGuard from '../src/index.ts'
@@ -44,12 +43,12 @@ afterEach(async () => {
 })
 
 /** One user message carrying the given text. */
-function userMessage(text: string): Message {
+function userMessage(text: string): UserMessage {
   return {
     role: 'user',
     content: [{ type: 'text', text }],
     source: { kind: 'user' },
-  } as unknown as Message
+  } as unknown as UserMessage
 }
 
 /** One assistant message with text + a tool call. */
@@ -140,10 +139,9 @@ async function bootLoop(
   engineConfig: Record<string, unknown> = {},
   taskText = TASK_TEXT,
   contextWindow = 300,
-): Promise<{ ctx: Context; agent: ReturnType<AgentLoop['create']>; adapter: MockAdapter }> {
+): Promise<{ ctx: Context; agent: Awaited<ReturnType<AgentLoop['create']>>; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
-  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(TokenMeter)
   await ctx.plugin(AgentLoop, { agents: [] })
   // Mount the REAL engine as a plugin: this wires its static inject
@@ -163,7 +161,7 @@ async function bootLoop(
   }))
   const adapter = new MockAdapter(script, contextWindow)
   ctx.llm.registerAdapter(['mock'], adapter)
-  const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+  const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
   agent.followup(createUserMessage({ content: [{ type: 'text', text: taskText }], source: { kind: 'user' } }))
   return { ctx, agent, adapter }
 }
