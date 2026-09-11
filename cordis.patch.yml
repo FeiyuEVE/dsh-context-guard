@@ -3,4 +3,4 @@
 # `dsh plugin --profile web add <path>` installed this package.
 - insert:
     - id: context-guard
-      name: dsh-context-guard
+      name: '@feiyueve/dsh-context-guard'

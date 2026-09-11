@@ -1,5 +1,5 @@
 {
-  "name": "dsh-context-guard",
+  "name": "@feiyueve/dsh-context-guard",
   "version": "0.2.4",
   "description": "DeepSeek Harness 上下文压力守卫插件：步骤结束时超阈值注入收尾提醒、agent 空闲时自动压缩超阈值会话、压缩完成后自动续跑任务（三者均可用配置开关）。Context-pressure guard plugin for DeepSeek Harness: wraps up over-threshold turns with an injected reminder, auto-compacts over-threshold idle sessions, and resumes the task after a completed compaction.",
   "type": "module",
