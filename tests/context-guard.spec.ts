@@ -7,6 +7,7 @@
  */
 
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -772,15 +773,66 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     expect(digest).toContain('- 会话: a1')
     expect(digest).toContain('- 第几次: 1')
 
-    // The continuation prompt names both real files. It is rendered after
-    // `compaction/end`, and the write is fire-and-forget from
-    // `compaction/summary`, so this also covers the wait on the in-flight
-    // write.
+    // The continuation prompt names both real files. Both the write and this
+    // render happen inside `compaction/summary`, so the pointers describe files
+    // that were already on disk when the region was replaced.
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain(path.join(sessionDir, 'epoch-1.digest.md'))
     expect(messages[0]!.text).toContain(path.join(sessionDir, 'epoch-1.raw.md'))
     expect(messages[0]!.text).not.toContain('本次压缩没有生成归档文档')
+    void ctx
+  })
+
+  it('lands the archive before the replacing message is dispatched', async () => {
+    const cwd = await workspace()
+    const { ctx, agent, compaction, adapter } = await harness(
+      [textResponse('first'), textResponse('resumed')],
+      {},
+      4000,
+      true,
+      undefined,
+      undefined,
+      cwd,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    compaction!.summaryText = '模型写的摘要'
+
+    // The ordering contract of 0.3.6: the archive must be on disk *before* the
+    // compaction takes effect. The backend appends the replacement
+    // (`surfaceOp: {op:'replace'}`) immediately after `compaction/summary` with
+    // no `await` in between, and `session/event` is `emit` — never awaited — so
+    // the only window is synchronous work inside the summary listener.
+    //
+    // This listener therefore reads the filesystem *synchronously*: it stands
+    // exactly where the region leaves the model's view, and whatever it sees is
+    // what a resumed agent would have seen. (Snapshotting beats asserting
+    // inside the callback, where a throw would be swallowed by the emitter.)
+    const sessionDir = path.join(cwd, '.handoff', 'sessions', 'a1')
+    const read = (name: string): string | undefined => {
+      try { return readFileSync(path.join(sessionDir, name), 'utf8') } catch { return undefined }
+    }
+    const atReplacement: { digest: string | undefined; raw: string | undefined }[] = []
+    ctx.on('session/event', (_session, event) => {
+      // `surfaceOp` is an envelope field, not `event.data`.
+      if (event.type !== 'user/message') return
+      if (typeof event.surfaceOp !== 'object' || event.surfaceOp.op !== 'replace') return
+      atReplacement.push({ digest: read('epoch-1.digest.md'), raw: read('epoch-1.raw.md') })
+    })
+
+    await cutOnce(compaction!, agent, adapter, 2)
+
+    expect(atReplacement).toHaveLength(1)
+    expect(atReplacement[0]!.digest).toContain('<!-- context-guard-digest v1 -->')
+    expect(atReplacement[0]!.raw).toContain('# 会话归档')
+    // The archive is not a copy of the checkpoint the model sees: the
+    // replacement carries the foreign model-written summary, the raw file the
+    // shadowed region verbatim.
+    expect(atReplacement[0]!.raw).toContain('start start')
+    expect(atReplacement[0]!.raw).not.toContain('模型写的摘要')
     void ctx
   })
 

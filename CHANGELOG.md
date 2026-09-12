@@ -4,6 +4,39 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.3.6] - 2026-09-12
+
+### 变更
+
+- **旁挂归档改为同步堵塞写盘：压缩生效的那一刻，文件已经在盘上**。0.3.5 的旁挂写盘是
+  fire-and-forget（在 `compaction/summary` 的监听器里 `void` 掉一个 promise），于是「归档先于替换」
+  只是**通常**成立：`session/event` 是 cordis `emit`（同步分发、**不 await** 监听器返回值），替换消息
+  紧跟在同一轮 append 里，写盘 I/O 完全可能落在替换之后。现在整条写盘链（`writeArchive` →
+  `writeAtomic`/`nextEpoch`/`readCarried`）都是同步 I/O，并且就在监听器里跑完 —— 监听器是同步调用的，
+  所以 `append('compaction/summary')` 返回时文件已经落盘，**严格早于**后端追加的替换消息。
+  为什么必须这样：`emit` 的监听器**无法**选择被等待（分发模式属于事件，不属于监听器），
+  `session/flush` 又发生在 `compaction/end` 之后 —— 都晚于替换。同步是唯一不碰 dsh 核心就能做到
+  「先落盘、再覆盖」的手段。
+  - 代价（知情接受）：调用方每次压缩多等几毫秒同步 I/O；归档盘卡住时会**拖住**压缩调用方，而不再是
+    「丢一份归档、压缩照常」。写盘仍是 tmp + `rename`，不会留半截文件。
+- **续跑提示新增交接文档声明块 `{{archive}}`**，并删掉无条件的「历史已确定性归档」。渲染前守卫已在
+  文件系统上确认过，所以有文件时就**陈述事实**：文档在哪、建议先读 digest、需要细节再读 raw，
+  并明确写「不要求通读，但请知道它在那里，需要时可直接 read」；没有文件时如实写
+  「本次压缩没有生成归档文档；上面那段摘要就是本次压缩的全部交接内容」。
+  - 这个块的用途是**上下文传递**：让续跑的 agent 知道上一段历史有归档可查，而不是让它去核查文件
+    是否存在（守卫已经查过，让它再查一遍是白费一步）。
+  - L3（`resumeMaxPerWindow` 达到、不唤醒）的通知里也带同一段声明。
+  - 记录的写盘结果不再是「在途 promise」：`archiveRecords` 直接存 `Artifacts`，渲染时同步读取。
+- 收尾语义收进内置默认续跑模板：`上下文已压缩。\n{{archive}}\n然后继续执行压缩前正在进行的任务…`。
+
+### 测试
+
+- 新增时序回归用例（`side-car archiving … > lands the archive before the replacing message is
+  dispatched`）：在替换消息（`surfaceOp: {op:'replace'}`）派发的**那一刻**同步读盘，断言
+  `epoch-1.raw.md`/`epoch-1.digest.md` 已经存在。把写盘改回延迟（`queueMicrotask`）该用例即失败 ——
+  这是「文件先于替换」唯一可自动验证的形式。
+- 新增 `archiveClause` 金样例（两条路径 / 只有 digest / 一无所获 / 进入默认模板 / L3 通知）。
+
 ## [0.3.5] - 2026-09-12
 
 ### 新增
@@ -25,7 +58,8 @@ dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peer
   与其共享 chunk 没有任何 dsh 运行时 import，那一串只出现在注释里）。`writeArchive` 新增 `minEpoch`：
   调用方若已知本会话压缩总数（守卫）可以钉住序号，扫描结果更高时以扫描为准，**任何情况下不重号**。
 - 续跑提示改走**记录优先**：守卫按 `compactionId → {rawPath, digestPath}` 记住自己写的文件
-  （值是在途 promise，续跑渲染时 `await`，避免「写盘比续跑慢」抢跑）。`compaction-basic` 的
+  （值是在途 promise，续跑渲染时 `await`，避免「写盘比续跑慢」抢跑；**0.3.6 起写盘同步完成，
+  该记录直接存 `Artifacts`，不再有在途态**）。`compaction-basic` 的
   checkpoint 是模型摘要、没有帧标记，这条记录是它唯一可信的路径来源；`FRAME_MARKER` 帧解析保留给
   自家引擎的指针帧。
 
@@ -40,6 +74,7 @@ dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peer
 - **落盘不保证先于覆盖**：`session/event` 是 cordis `emit`（同步分发、**不 await** 监听器），而
   `compaction/summary` 之后紧接（中间无 `await`）就是区间替换消息。进程恰好在该窗口被杀只丢这一份
   归档，checkpoint 不受影响（模型摘要照旧）；写盘一律 tmp + `rename`，不会留半截文件。
+  （**0.3.6 已废止此条**：写盘改为同步堵塞，落盘严格先于替换。）
 - **路径只能靠续跑提示进上下文**：关掉 `resumeAfterCompact`、agent 非空闲、或下一次压缩裁掉那条
   消息时，模型看不到路径（文件仍在磁盘上）。
 - 只归档 `compaction/summary`；模型无关的 `compaction/prune` 不写归档（无摘要区间，混入同一套

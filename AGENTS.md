@@ -55,7 +55,7 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
 | `src/digest.ts` | 确定性事实抽取与 digest 渲染（`extractFacts`/`composeDigest`/`parseDigest`/`carriedFrom`） |
 | `src/paths.ts` | 落点计算：`sessionDirName`/`archiveLocation`/`digestPointerCandidates` |
 | `src/settings.ts` | `context-guard` 命名空间：schema、默认值、优先级解析 |
-| `src/resume-prompt.ts` | 纯函数提示词渲染：`decideResume`(L0–L3)、`buildWrapUpPrompt`、内置默认模板 |
+| `src/resume-prompt.ts` | 纯函数提示词渲染：`decideResume`(L0–L3)、`archiveClause`（`{{archive}}` 交接文档声明块）、`buildWrapUpPrompt`、内置默认模板 |
 | `src/session-facts.ts` | 结构化读会话：压缩节奏、可用委派工具、待办、最后一次人类意图 |
 | `src/messages-to-md.ts` | 纯函数清洗：会话区段 → Markdown（无 I/O、无时间戳、可 golden 测试） |
 | `src/log.ts` | 单行日志 sink：`context-guard[/scope]: event k=v`，同时投递 `ctx.logger` 与 console |
@@ -93,12 +93,15 @@ npm run verify      # typecheck && test && build（顺序固定）
   `# 第 N 次压缩 · 接力笔记 · <主题>`；守卫只算路径、不建目录（`write` 工具自建父目录），
   所以空目录仍等于「从未归档」。
 - **续跑提示里的路径必须为真**，两个来源按可信度排序：①守卫按 `compactionId` 存下的**旁挂写盘记录**
-  （值是在途 promise，渲染时 `await` —— `compaction/end` 的 microtask 会抢在写盘 I/O 之前）；
-  ②本引擎的指针帧（帧首 `FRAME_MARKER` 标记归属，外域摘要一律不认）。两者都只收绝对路径、
-  都要落盘确认；否则模板渲染成「本次未生成摘要文件 / 归档文件」。
-- **旁挂归档的两点已知弱化**（`session/event` 是 `emit`，不 await 监听器；`compaction/summary` 之后
-  紧接无 `await` 的替换消息）：落盘不保证先于覆盖（丢了只损这一份归档，checkpoint 无碍），
-  路径只能靠续跑提示进上下文。详见 `docs/gotchas.md`。
+  （写盘同步完成，记录里直接就是 `Artifacts`）；②本引擎的指针帧（帧首 `FRAME_MARKER` 标记归属，
+  外域摘要一律不认）。两者都只收绝对路径、都要落盘确认；确认到就渲染 `{{archive}}` 声明块
+  （说明文档在哪、不要求通读），都没有则如实渲染成「本次压缩没有生成归档文档」。
+- **旁挂归档必须同步落盘**（`session/event` 是 `emit`，**不 await** 监听器；`compaction/summary` 之后
+  紧接无 `await` 的替换消息）：写盘走同步 I/O，`append('compaction/summary')` 返回时文件已在盘上，
+  **严格先于替换**；`session/flush`（可 await 的钩子）发生在 `compaction/end` 之后，救不了这个窗口。
+  代价是归档盘卡住会拖住压缩调用方。回归用例见 `tests/context-guard.spec.ts` 的
+  `lands the archive before the replacing message is dispatched`；路径只能靠续跑提示进上下文这一点
+  仍是已知弱化。详见 `docs/gotchas.md`。
 - **日志一律走 `createLogSink`**（`ctx.logger` + console 双投递），字段不含正文。
 - **配置优先级处处一致**：`settings 用户层 > 组合 config > 内置默认`；解析结果含空字符串都必须照用。
 

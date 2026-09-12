@@ -75,10 +75,13 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
 - **进入上下文的只有短帧**，不是 digest 正文：接管模式下，帧给路径 + 读取规则（`regionTokens ≥ 600`
   时另加一行 ≤60 字线索）；旁挂模式下 checkpoint 由别人的压缩机决定，路径通过**续跑提示**进入上下文
   （见下）。格式契约见 [`docs/digest-format.md`](docs/digest-format.md)。
-- **旁挂模式的两点取舍**（已知、接受）：
-  1. `session/event` 是 cordis 的 `emit`（同步分发、**不等待**监听器），而 `compaction/summary` 之后
-     **紧接**（中间无 `await`）就是区间替换 —— 所以落盘不保证先于覆盖。进程恰好在该窗口被杀，只会
-     丢这一份归档，`checkpoint` 不受影响（模型摘要照旧）；写盘一律 tmp + `rename`，不会留半截文件。
+- **旁挂模式的两点取舍**：
+  1. **写盘是同步堵塞的**：`session/event` 是 cordis 的 `emit`（同步分发、**不等待**监听器返回值），
+     `compaction/summary` 之后**紧接**（中间无 `await`）就是区间替换 —— 监听器唯一能保证「先落盘」
+     的手段就是在这轮同步调用里把文件写完。所以归档用的是同步 I/O：`append('compaction/summary')`
+     返回时 `epoch-N.raw.md` / `epoch-N.digest.md` 已经在盘上，**严格早于**替换消息生效。
+     代价：调用方每次压缩多等几毫秒；归档盘卡住会拖住压缩调用方。写盘一律 tmp + `rename`，
+     不会留半截文件。（对比 0.3.5：那时是 fire-and-forget，落盘只是**通常**早于替换。）
   2. 路径只能靠**续跑提示**进上下文：checkpoint 是别人的摘要，不会带我们的路径。关掉
      `resumeAfterCompact`、agent 非空闲、或下一次压缩裁掉那条消息时，模型看不到路径（文件仍在磁盘上）。
 
@@ -125,13 +128,15 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 - 越界配置（如 `thresholdRatio: 2`）不抛错：记录 `error` 日志并回退 0.85。
 - 归档写盘失败只 `warn` 不抛：帧降级为「无路径」或「只有 raw」，压缩本身照常成功。
 - **续跑提示里的归档路径只在真有时才写**，两个来源按可信度排序：
-  1. **守卫自己的记录** —— 旁挂归档写完时按 `compactionId → {rawPath, digestPath}` 记下（值是在途
-     promise，续跑渲染时 `await`，因此不会被「写盘比续跑慢」抢跑）。这是 `compaction-basic` 会话
-     唯一可用的来源，因为它的 checkpoint 里根本没有路径。
+  1. **守卫自己的记录** —— 旁挂归档写完时按 `compactionId → {rawPath, digestPath}` 记下（写盘同步
+     完成，所以记录里就是落盘结果本身）。这是 `compaction-basic` 会话唯一可用的来源，因为它的
+     checkpoint 里根本没有路径。
   2. **本引擎的确定性指针帧** —— 帧首必须带 `dsh-context-guard 确定性归档` 标记（外域摘要一律不认）。
 
-  两个来源都会再落盘确认一次。所以会话不会被告知去读一个不存在的 digest；确实没有时，模板里的
-  `{{digest}}`/`{{raw}}` 渲染成「本次未生成摘要文件 / 归档文件」。
+  两个来源都会再落盘确认一次。确认到一个，就渲染 `{{archive}}` 声明块（文档在哪、建议先读 digest、
+  「不要求通读，但请知道它在那里」）；一个都没有时如实写「本次压缩没有生成归档文档；上面那段摘要
+  就是本次压缩的全部交接内容」，而 `{{digest}}`/`{{raw}}` 渲染成「本次未生成摘要文件 / 归档文件」。
+  守卫**不会**让 agent 自己去核查文件是否存在 —— 它已经查过了。
 - 所有监听器的运行期异常均被包含并记日志，任何情况下都不向外抛出。
 
 ## 配置 / Config
@@ -202,8 +207,13 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 > 注入，不会被组合层文本悄悄顶回来（该语义由 `tests/context-guard.spec.ts` 的 template precedence 用例
 > 守住；2026-09-12 浏览器验证时发现旧实现做不到，已修）。
 
-续跑模板占位符：`{{epoch}}` `{{window}}` `{{compactions}}` `{{digest}}` `{{raw}}` `{{intent}}`；
-收尾模板占位符：`{{todos}}`。未知占位符原样保留。
+续跑模板占位符：`{{epoch}}` `{{window}}` `{{compactions}}` `{{archive}}` `{{digest}}` `{{raw}}`
+`{{intent}}`；收尾模板占位符：`{{todos}}` `{{notePath}}` `{{epoch}}`。未知占位符原样保留。
+
+- `{{archive}}` 是**交接文档声明块**：有归档时给出 digest/raw 的绝对路径并说明「不要求通读，但请
+  知道它在那里，需要时可直接 read」，没有归档时如实说明本次没有归档文档。它只在守卫确认文件存在
+  之后才给出路径。想让续跑提示更短，可以在自己的模板里删掉 `{{archive}}`；想保留路径但不要声明
+  文案，则用 `{{digest}}`/`{{raw}}`（缺失时渲染成「（本次未生成摘要文件）」/「（本次未生成归档文件）」）。
 
 阈值判定优先级：`供应商阈值 > 默认阈值 > 组合配置的 thresholdRatio × contextWindow`。
 
@@ -292,10 +302,12 @@ npm run verify      # 三者全跑
 
 测试套件（`tests/`）通过真实 agent loop 驱动脚本化 mock adapter，覆盖完整闭环（提醒 → 收尾 → 空闲
 压缩 → 续跑）、阈值以下无动作、已收尾步骤不提醒、失败压缩不续跑、每个配置开关、每周期一次防循环
-语义、**旁挂归档**（外来后端写 raw+digest 并被续跑提示引用、跨次编号与继承、自家引擎不重复写），
+语义、**旁挂归档**（外来后端写 raw+digest 并被续跑提示引用、跨次编号与继承、自家引擎不重复写、
+**替换消息派发那一刻归档已在盘上**），
 以及新增模块的纯函数契约：摘要抽取/预算梯度/继承与版本失配（`digest.spec.ts`）、落点与目录名
-清洗（`paths.spec.ts`）、分级续跑决策（`resume-prompt.spec.ts`）、会话事实读取（`session-facts.spec.ts`）、
-设置解析与优先级（`settings.spec.ts`）、共用写盘器与 `minEpoch` 编号（`archive.spec.ts`）。
+清洗（`paths.spec.ts`）、分级续跑决策与 `{{archive}}` 声明块（`resume-prompt.spec.ts`）、会话事实读取
+（`session-facts.spec.ts`）、设置解析与优先级（`settings.spec.ts`）、共用写盘器与 `minEpoch` 编号
+（`archive.spec.ts`）。
 
 ## 已知限制 / Known Limitations
 
@@ -316,6 +328,9 @@ npm run verify      # 三者全跑
   它是纯剪枝、没有摘要区间，混进同一套 `epoch-N` 编号会让 digest 与序号错位。
 - 会话没有 `cwd` 时不旁挂写盘（`.handoff` 会相对宿主进程的工作目录解析），只记一行
   `sidecar: skipped reason=no-cwd`。
+- **旁挂写盘是同步堵塞的**（0.3.6 起）：它换取「压缩生效那一刻归档必已在盘上」，代价是每次压缩调用方
+  多等几毫秒同步 I/O；归档盘卡住会拖住压缩调用方。旁挂落点是会话的 `<cwd>/.handoff`（host 半边没有
+  `archiveDir` 开关，那是压缩引擎行才有的字段），所以把工作区放在慢速网络盘上时，这份等待会跟着变长。
 - digest 含用户文本与路径：父仓库 `.gitignore` 已 ignore `.handoff/sessions/`。
 - 同一会话的并发压缩靠 guard 的 `compacting` 标记串行化；跨进程并发写同一会话仍未加文件锁。
 

@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_RESUME_PROMPT,
   DEFAULT_WRAP_UP_PROMPT,
+  archiveClause,
   buildWrapUpPrompt,
   decideResume,
 } from '../src/resume-prompt.ts'
@@ -94,6 +95,45 @@ describe('decideResume', () => {
     // The handoff clause states plainly that nothing was archived, instead of
     // claiming the history was archived and then naming a missing file.
     expect(decision.prompt).toContain('本次压缩没有生成归档文档')
+  })
+})
+
+describe('archiveClause', () => {
+  it('states that the document exists and where, without demanding a read', () => {
+    expect(archiveClause(facts({ epoch: 4 }))).toBe([
+      '本次压缩的交接文档（上一段上下文的归档）：',
+      '- 精简接力摘要（建议先读）：`/w/.handoff/sessions/a1/epoch-1.digest.md`',
+      '- 完整原文归档（需要细节时再读）：`/w/.handoff/sessions/a1/epoch-1.raw.md`',
+      '不要求通读，但请知道它在那里，需要时可直接 read。',
+    ].join('\n'))
+  })
+
+  it('names only the digest when that is all the backend wrote', () => {
+    const clause = archiveClause(facts({ rawPath: undefined }))
+    expect(clause).toContain('epoch-1.digest.md')
+    expect(clause).not.toContain('完整原文归档')
+    expect(clause).toContain('不要求通读')
+  })
+
+  it('says plainly that nothing was archived instead of claiming otherwise', () => {
+    expect(archiveClause(facts({ digestPath: undefined, rawPath: undefined })))
+      .toBe('本次压缩没有生成归档文档；上面那段摘要就是本次压缩的全部交接内容。')
+  })
+
+  it('is rendered into the built-in template and never asks the agent to check the file', () => {
+    const prompt = decideResume(DEFAULT_RESUME_PROMPT, facts(), { escalation: true }).prompt
+    expect(prompt).toContain('本次压缩的交接文档')
+    expect(prompt).toContain('epoch-1.digest.md')
+    expect(prompt).toContain('epoch-1.raw.md')
+    // The guard checked the filesystem; the agent is only told, not sent to verify.
+    expect(prompt).not.toContain('确认')
+    expect(prompt).not.toContain('是否存在')
+  })
+
+  it('is part of the L3 notice too, so a suppressed resume still points at the archive', () => {
+    const prompt = decideResume(DEFAULT_RESUME_PROMPT, facts({ compactionsInWindow: 5 }), { escalation: true }).prompt
+    expect(prompt).toContain('本次压缩的交接文档')
+    expect(prompt).toContain('epoch-1.digest.md')
   })
 })
 

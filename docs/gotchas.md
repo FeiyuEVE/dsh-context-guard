@@ -64,20 +64,25 @@
 
 ## 归档与 digest
 
-- **旁挂归档不能保证「写盘先于覆盖」（2026-09-12，0.3.5 设计时确认）**：守卫的旁挂写盘挂在
+- **旁挂归档必须同步落盘才能「写盘先于覆盖」（2026-09-12，0.3.6 修）**：守卫的旁挂写盘挂在
   `compaction/summary` 上，而这个事件**不是**可等待的钩子 —— `session/event` 走 cordis 的 `emit`
   （`vendor/cordis/lib/index.js` 注释原文：run listeners synchronously *without waiting for returned
-  promises*），而 `compaction-basic/src/region.ts` 在追加 `compaction/summary`（476 行）之后
-  **紧接**（中间无 `await`）就在 489 行追加替换消息。所以：区间取回用的是**只增日志**
-  （`session.eventAt(seq)` 读 `this.log[seq]`，替换只改表层投影，不动日志），因此取内容永远安全；
-  但写文件是 fire-and-forget，进程在该窗口被杀只丢这一份归档，checkpoint 不受影响。
-  **推论**：不要把「归档已落盘」当成压缩事务的前置条件；也不要在旁挂路径上做需要与替换串行的动作。
-  引擎那条路（`ArchiveCutEngine` 覆写 `summarize()`）没有这个弱化 —— 写盘发生在 `summarize()` 返回
-  之前，早于替换。两条路的差别就写在这里，改代码前先想清楚在哪条路上。
-- **旁挂写盘不能 `void` 完就算**：续跑提示在 `compaction/end` 之后的一个 microtask 里渲染，
-  通常**赢过**旁挂第一次 `mkdir` 的 I/O 回调。因此记录表存的是**在途 promise**，渲染时 `await`；
-  否则 `compaction-basic` 会话（checkpoint 里没有路径）永远渲染「本次未生成摘要文件」。
-  实测症状：`resume: sent … digest=undefined` 而盘上文件已经存在。
+  promises*；分发模式属于事件，**监听器无法选择被等待**），而 `compaction-basic/src/region.ts` 在追加
+  `compaction/summary`（476 行）之后**紧接**（中间无 `await`）就在 489 行追加替换消息。
+  `session/flush` 虽然可 await，却在 `compaction/end`（后于替换）才跑，救不了这个窗口。
+  所以唯一的办法是**在监听器里用同步 I/O 把文件写完**：监听器是同步调用的，`append()` 返回时文件
+  已在盘上，严格早于替换。0.3.5 曾用 `void promise`（fire-and-forget），那时「先落盘」只是通常成立
+  —— 这是 0.3.6 改掉的东西。代价：归档盘卡住会拖住压缩调用方（不再是「丢一份归档、压缩照常」）。
+  **推论**：`src/archive.ts` 全链保持同步（`mkdirSync`/`writeFileSync`/`renameSync`/`readFileSync`），
+  不要在旁挂路径上引入 `await`；区间取回本身用的是**只增日志**（`session.eventAt(seq)` 读
+  `this.log[seq]`，替换只改表层投影、不动日志），取内容永远安全。
+  引擎那条路（`ArchiveCutEngine` 覆写 `summarize()`）本来就早于替换，两条路现在口径一致。
+  回归门禁：`tests/context-guard.spec.ts` 的 `lands the archive before the replacing message is
+  dispatched`（在替换消息派发的那一刻同步读盘；把写盘改成 `queueMicrotask` 它会失败）。
+- **记录表不再是在途 promise**：0.3.5 时续跑提示在 `compaction/end` 之后的 microtask 里渲染，
+  通常**赢过**旁挂第一次 `mkdir` 的 I/O 回调，所以记录表存的是在途 promise、渲染时 `await`；
+  症状是 `resume: sent … digest=undefined` 而盘上文件已经存在。0.3.6 写盘同步完成，记录里直接就是
+  落盘的 `Artifacts`，同步读取即可 —— **这条 `await` 的存在本身就是写盘不同步的信号**。
 - **`writeArchive` 的 `minEpoch` 语义**：`max(扫描值, minEpoch)`。守卫知道自己会话的压缩总数
   （`compactionPace().sessionTotal + 1`，与收尾笔记 `{{epoch}}` 同源），引擎只管扫描。
   低报不会让序号倒退（扫描优先），高报只是留空洞 —— **任何一侧都不允许重号覆盖别人**。
@@ -99,8 +104,8 @@
   `isAbsolute=false`）。三道闸门现在缺一不可：
   1. **帧标记**（`FRAME_MARKER`，帧首固定句）—— 非本引擎的帧一律不认，连指针探测都不做；
   2. **只收绝对路径** —— 裸文件名是「提及」不是「指向」；
-  3. **落盘确认**（`existingFile`）—— 路径必须真是文件，否则模板退回
-     「（本次未生成摘要文件 / 归档文件）」。
+  3. **落盘确认**（`existingFile`）—— 路径必须真是文件；确认不到时 `{{archive}}` 如实写
+     「本次压缩没有生成归档文档」，`{{digest}}`/`{{raw}}` 退回「（本次未生成摘要文件 / 归档文件）」。
   回归用例：`tests/context-guard.spec.ts` 的 `resume archive pointers`（含外域摘要、真文件、文件已删
   三种）与 `tests/digest.spec.ts` 的 `digestPathFrom`。**排查口径**：非归档引擎的会话「没有归档」是
   正常态（`agentPreset: standard` → `compaction-basic`，事件里 `provider=deepseek-official`、

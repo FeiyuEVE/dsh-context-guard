@@ -187,7 +187,14 @@ targetTokens = max(260, min(digestMaxTokens, regionTokens × digestTargetRatio))
 
 - **旁挂模式**（默认）：checkpoint 是原压缩机的产物（如 `compaction-basic` 的模型摘要），不含路径；
   路径改由**续跑提示**给出，来源是守卫按 `compactionId` 存的写盘记录（本文件不规定提示词文本，
-  见 `src/resume-prompt.ts`）。
+  见 `src/resume-prompt.ts` 的 `archiveClause`）。该模板片段（`{{archive}}`）**陈述文档存在与位置**
+  （「不要求通读，但请知道它在那里，需要时可直接 read」），不要求 agent 去核查文件 —— 守卫渲染前
+  已经落盘确认过。
+
+**写盘时序是格式契约的一部分**：旁挂写盘在 `compaction/summary` 的监听器里**同步**跑完，所以后端
+追加替换消息（区间离开模型视野）时，本文件的 raw 与 digest 已经在盘上；两条路（接管 / 旁挂）现在
+都满足「归档先于覆盖」。改 `src/archive.ts` 时不要把同步 I/O 换成 promise —— 详见
+`docs/gotchas.md`「旁挂归档必须同步落盘」。
 
 **帧必须瘦**：基类（`compaction-basic`）强制「摘要必须小于被替换内容」的收缩不变量，帧写胖了会
 在小区间上直接让压缩失败（`summary is not smaller than the shadowed content`）。所以 `- 线索：`
