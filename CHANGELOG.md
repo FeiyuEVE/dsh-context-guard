@@ -4,6 +4,28 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.4.1] - 2026-09-12
+
+### 修复
+
+- **摘要抽取口径收严：不再把过程噪音、文档标题误判和后台任务通知当成交接知识**。线上第一份
+  由 0.4.0 产出的摘要（`epoch-8`，362 条消息 / 193 次工具调用）暴露出四处误判，本节逐一收口；
+  同一段真实区间重放后，`报错与修复` 由 6 条降到 0 条、`主要意图` 首条回到真人请求、
+  `关键技术概念` 由 `git, ts, js, json, npm, docker` 变为 `git, npm, docker, curl, pnpm, systemctl`。
+  - **重试即消的策略拒绝不再进 `报错与修复`**（新增 `PROCESS_NOISE`）。原逻辑对 `isError: true`
+    无条件收录，于是 6 条里有 5 条是 `Error: cannot modify "…": file has not been read — read the
+    file, then retry` 与 `Error: old_string was not found` —— agent 下一步就修好了，读者学不到东西。
+  - **数字前缀不再算诊断形态**。`DIAGNOSTIC_LINE` 加上 `(?![0-9]+:)`：原来 `grep -n` 的行号
+    （`38:### … 报错判据收严`）会同时满足「诊断形态」与被 `ERROR_LINE` 命中的中文「报错」，
+    把一条**变更日志标题**抬成了报错。
+  - **后台任务完成通知不再算用户请求**（新增 `isJobNotice()`）。`tool-jobs` 的通知是
+    `role: 'user'` + `form: 'notice'`，其 `summary` 就是跑过的命令行，于是「plugin notice 取
+    summary」这条既有规则把 `bash cd … && sed …` 抬成 `主要意图` **首条**，真人那句掉到第二。
+  - **`关键技术概念` 不再收录路径扩展名**，并收严命令首词。原口径把扩展名当技术栈；重放同一区间
+    又暴露两种首词噪音：shell 关键字 `for`（来自 `for p in …`）与变量赋值
+    `p=/home/…/@feiyueve/dsh-context-guard;`。现在只收 `COMMAND_CONCEPTS` 词表与**真正的程序名**
+    （匹配 `^[a-z][a-z0-9._+-]*$`、非 `SHELL_KEYWORD`、非 `COMMAND_NOISE`）。
+
 ## [0.4.0] - 2026-09-12
 
 ### 变更

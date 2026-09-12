@@ -95,6 +95,12 @@ npm run verify      # typecheck && test && build（顺序固定）
   与被压缩掉的体量同量级，留着等于一份随时会被整份读回来的第二份上下文。**改 `nextEpoch` 前先看
   `src/archive.ts`**：它的编号正则必须同时覆盖 `*.raw.md` 与 `*.digest.md`，只扫 raw 会在关闭时
   让序号每次从 1 重来并覆盖上一份摘要。
+- **摘要抽取的每条判据都有「反面」（0.4.1 起）**：`isError: true` 不等于值得交接（策略拒绝重试即消）、
+  数字前缀不是程序名（`grep -n` 的 `38:` 骗过诊断形态）、`plugin notice` 的 `summary` 不一定是人话
+  （`tool-jobs` 的 summary 是命令行）、扩展名不是技术栈。改 `src/digest.ts` 口径前先读
+  `docs/digest-format.md` §4 与 `docs/gotchas.md` 的四处误判记录；新判据要配 `tests/digest.spec.ts`
+  的**反例**用例。想验证真实效果，把线上区间灌回抽取器重放（方法见 `docs/gotchas.md` 末条：
+  工具结果在日志里是独立记录类型、splice 必须还原，否则区间是残的）。
 - **归档必须无 NUL**（0.3.7 起）：所有归档写盘都经 `writeAtomic` → `sanitizeDocText()`，剥 ANSI、CR→LF、
   NUL→`␀`、丢其余 C0/DEL。原因是**一个 NUL 就让 Web 文档预览拒开整份文件**（`workspace-file/not-text`
   →「非文本文件，暂时无法预览。」），而工具结果里带 NUL 是常态（`/proc/<pid>/cmdline` 用 NUL 分隔）。

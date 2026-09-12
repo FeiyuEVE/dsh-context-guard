@@ -110,10 +110,10 @@ digest 不是「模型写的摘要」，它是**纯代码抽取的事实列表**
 
 | 标题 | 来源 | 抽取规则 |
 |---|---|---|
-| `主要意图` | 区间内**非注入**的 user 消息 | 原文 clip 到 `itemChars`；plugin notice 取 `source.summary` 而非正文 |
-| `关键技术概念` | 路径扩展名 + 命令词 | `/\.([a-z0-9]{1,5})$/`；`COMMAND_CONCEPTS` 词表（git/npm/docker/…）+ 命令首词 |
+| `主要意图` | 区间内**非注入、非通知**的 user 消息 | 原文 clip 到 `itemChars`；守卫自己的 plugin notice 取 `source.summary` 而非正文；**后台任务完成通知不算**（见下） |
+| `关键技术概念` | 命令文本 | `COMMAND_CONCEPTS` 词表（git/npm/docker/…）+ 命令**首词**，且首词须是程序名（匹配 `^[a-z][a-z0-9._+-]*$`、不在 `COMMAND_NOISE`、不是 `SHELL_KEYWORD`）。**路径扩展名不计入**——`涉及文件` 已列出完整路径，`ts`/`js`/`json` 检索不到任何东西 |
 | `涉及文件` | 工具调用参数 | 键 `file_path`/`absolute_path`/`path`/`glob`/`pattern` 等；`WRITE_TOOL` 命中的工具记 `W×`，否则 `R×` |
-| `报错与修复` | tool-result 块 | 块 `isError` 为真，**或**（**首个非流标记行**命中 `ERROR_LINE`（中英双语）**且**该行具备诊断形态 `^\S{1,32}:\s*\S`）；取所在工具调用名。`[stdout]`/`[stderr]`/`[exit code: N]` 是包装标记、先跳过 |
+| `报错与修复` | tool-result 块 | 块 `isError` 为真，**或**（**首个非流标记行**命中 `ERROR_LINE`（中英双语）**且**该行具备诊断形态 `^(?![0-9]+:)[\w.+-]{1,32}:\s*\S`）；取所在工具调用名。`[stdout]`/`[stderr]`/`[exit code: N]` 是包装标记、先跳过。**重试即消的策略拒绝**（`PROCESS_NOISE`）两种情况都不收 |
 | `未完成待办` | `todo_write` 结构化参数优先，其次自由文本 | 结构化：`todos[].status !== 'completed'`；文本：`- [ ] ` 未勾选行 + `TODO:/FIXME:/待办:` 行。**渲染时去掉首项**（首项在「下一步」） |
 | `当前进展` | 区间末 | 最后一条 assistant 文本的前三个非空行。**不再复述最后一条用户请求**——它已经是「主要意图」的末项 |
 | `下一步` | 待办首项 | 无待办则 `（无）` |
@@ -122,9 +122,15 @@ digest 不是「模型写的摘要」，它是**纯代码抽取的事实列表**
 抽取的硬规则：
 
 - **注入上下文一律丢弃**（`isInjectedContext()`）：`agent-instructions`/`skill-catalog`/`system`
-  三类 source，以及 plugin source 中 `context-guard`/`dsh-context-guard`/`compact` 或
-  form 为 `snapshot`/`instructions`/`catalog`/`notice` 的消息。理由：这些内容 host 每次请求都会
+  三类 source，以及 plugin source 中 `context-guard`/`dsh-context-guard`/`compact`，或 form 为
+  `snapshot`/`instructions`/`catalog` 的消息。理由：这些内容 host 每次请求都会
   重发，模型不可能丢，写进 digest 是纯浪费 —— 实测它们占了 raw 归档的**大部分**体积。
+  注意 `notice` **不在**这个列表里：别的插件的通知并非 host 重发，只有守卫自己那三个插件名的
+  notice 才按注入处理。
+- **后台任务通知不算用户请求**（`isJobNotice()`）：`tool-jobs` 的任务完成通知是 `role: 'user'` +
+  `form: 'notice'`，而它的 `summary` 就是**跑过的那条命令行**，于是「plugin notice 取 summary」这条
+  规则会把 `bash cd … && sed …` 抬成 `主要意图` 首条、把真人那句挤到第二位。它一次性投递、不会重发，
+  所以不并入 `isInjectedContext`（后者还要驱动 `rawExcludeInjected`）。
 - **去重**：`dedupKey()` 做大小写与标点归一（保留字母数字、`/`、汉字）；先出现者胜。
 - **截断标记**：条目超过 `sectionCap` 时保留**最新**的 `cap-1` 条，并在首行插入
   `（省略 <k> 条较早的条目）`。

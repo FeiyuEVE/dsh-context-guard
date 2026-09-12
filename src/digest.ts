@@ -101,7 +101,7 @@ export interface DigestFacts {
   toolCallCount: number
   /** Verbatim user requests, oldest first. */
   intents: string[]
-  /** Command words and file extensions seen. */
+  /** Command words and command heads seen; tooling, not file extensions. */
   concepts: string[]
   /** Touched paths with read/write counts. */
   files: Map<string, { reads: number; writes: number }>
@@ -199,8 +199,25 @@ const ERROR_LINE = /(error|failed|failure|fatal|exception|enoent|eacces|eperm|de
  * printed while investigating. Real diagnostics arrive as `sh: 1: ps: not found`
  * or `Error: tool call aborted`, which have this shape; banners start with
  * punctuation and do not.
+ *
+ * A prefix of digits alone is a `grep -n` line number, not a program name. A
+ * real digest recorded `bash: 38:### [2026-09-12] … 报错判据收严` — the heading of
+ * a changelog entry that merely contained the word 报错, promoted to a
+ * diagnostic because the *line number in front of it* looked like `name:`.
+ * Anything before the colon must therefore name something, not just count.
  */
-const DIAGNOSTIC_LINE = /^[\w.+-]{1,32}:\s*\S/
+const DIAGNOSTIC_LINE = /^(?![0-9]+:)[\w.+-]{1,32}:\s*\S/
+/**
+ * Failures an agent clears by re-issuing the same call, and therefore process
+ * noise rather than knowledge for the next session.
+ *
+ * These arrive with `isError: true`, so the flag alone keeps them; one real
+ * digest spent five of its six 报错与修复 bullets on `edit: Error: cannot modify
+ * "…": file has not been read — read the file, then retry` and `Error:
+ * old_string was not found`, all of which the agent fixed in the next step. A
+ * reader of the digest learns nothing from them.
+ */
+const PROCESS_NOISE = /file has not been read|old_string was not found/i
 /** Command heads that say nothing about the work: shell builtins and navigation. */
 const COMMAND_NOISE = new Set([
   'cd', 'ls', 'pwd', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'true', 'false',
@@ -213,8 +230,27 @@ const COMMAND_NOISE = new Set([
   'return', 'break', 'continue', 'dirs', 'pushd', 'popd', 'mount', 'sync', 'reset',
   'hostname', 'tty', 'stty', 'ln', 'dd', 'mktemp', 'install',
 ])
-/** File extensions that name a document, not a technology. */
-const EXTENSION_NOISE = new Set(['md', 'txt', 'log', 'lock', 'tmp', 'bak', 'map', 'out'])
+/**
+ * Shell keywords: they open a construct, they are not the program being run.
+ *
+ * A replay of a real region listed `for` as a 关键技术概念 — lifted from
+ * `for p in …; do …` — and it survived every other filter because its shape is
+ * indistinguishable from a command name.
+ */
+const SHELL_KEYWORD = new Set([
+  'for', 'while', 'until', 'if', 'then', 'else', 'elif', 'fi', 'do', 'done',
+  'case', 'esac', 'in', 'function', 'select', 'coproc',
+])
+/**
+ * Shape of a real command head.
+ *
+ * The first whitespace-separated word of a shell command is not necessarily a
+ * program: `p=/some/long/path; systemctl …` starts with an *assignment*, and a
+ * real replay lifted the whole `p=/home/…/@feiyueve/dsh-context-guard;` string
+ * into the concepts. A program name starts with a letter and carries no `=`
+ * and no `/`.
+ */
+const COMMAND_NAME = /^[a-z][a-z0-9._+-]*$/
 /**
  * Markers a tool wraps captured output in: `[stderr]`, `[stdout]`, `[exit code: N]`.
  * They are structure, not message — see {@link resultFirstLines}.
@@ -284,6 +320,28 @@ export function isInjectedContext(message: Message): boolean {
   if (plugin === 'context-guard' || plugin === 'dsh-context-guard' || plugin === 'compact') return true
   const form = source.form
   return form === 'snapshot' || form === 'instructions' || form === 'catalog'
+}
+
+/**
+ * A background-job completion notice, spliced into the inbox by `tool-jobs`.
+ *
+ * It is a `role: 'user'` message with `source.form === 'notice'` whose
+ * `summary` is the *command line that was run*, and the intent rule below
+ * (`notice ?? text`) would therefore promote `bash cd … && sed …` into 主要意图 —
+ * a real digest opened the section with a `sed` invocation and pushed the
+ * human's actual question to second place. The notice is process bookkeeping:
+ * nobody asked for it, and its text is a duplicate of the tool call the digest
+ * already accounts for.
+ *
+ * Kept separate from {@link isInjectedContext} on purpose: that predicate means
+ * "host context re-sent every request" and also drives `rawExcludeInjected`,
+ * while this notice is delivered once and then never reappears.
+ */
+function isJobNotice(message: Message): boolean {
+  const source = message.source as { kind: string; plugin?: string; form?: string; summary?: string }
+  if (source.kind !== 'plugin' || source.form !== 'notice') return false
+  if (source.plugin === 'tool-jobs') return true
+  return /^background job\b/i.test(String(source.summary ?? ''))
 }
 
 /**
@@ -417,13 +475,10 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
           if (WRITE_TOOL.test(block.name)) entry.writes += 1
           else entry.reads += 1
           facts.files.set(filePath, entry)
-          const extension = /\.([a-z0-9]{1,5})$/i.exec(filePath)
-          if (extension !== null) {
-            const token = (extension[1] ?? '').toLowerCase()
-            if (token.length > 0 && !EXTENSION_NOISE.has(token) && !facts.concepts.includes(token)) {
-              facts.concepts.push(token)
-            }
-          }
+          // The extension is deliberately *not* lifted into concepts. 涉及文件
+          // already prints the whole path, so `ts` / `js` / `json` only padded a
+          // real digest's 关键技术概念 with tokens that retrieve nothing. What
+          // this section is for is the tooling vocabulary below.
         }
         const command = argString(parsed, COMMAND_KEYS)
         if (command !== undefined) {
@@ -433,7 +488,12 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
             if (!facts.concepts.includes(token)) facts.concepts.push(token)
           }
           const head = command.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
-          if (head.length > 0 && !COMMAND_NOISE.has(head) && !facts.concepts.includes(head)) {
+          if (
+            COMMAND_NAME.test(head) &&
+            !COMMAND_NOISE.has(head) &&
+            !SHELL_KEYWORD.has(head) &&
+            !facts.concepts.includes(head)
+          ) {
             facts.concepts.push(head)
           }
         }
@@ -451,6 +511,10 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
     const results = resultFirstLines(message.content)
     if (results.length > 0) {
       for (const result of results) {
+        // A retry clears these on the next step, so they say nothing about the
+        // work. Checked first: `isError` is true for them, and the flag alone
+        // would keep them. See PROCESS_NOISE.
+        if (PROCESS_NOISE.test(result.line)) continue
         // A successful call can still print a failure (`sh: 1: ps: not found`),
         // so a non-error result is only believed when the line also has the
         // diagnostic shape — otherwise prose that merely mentions an error is
@@ -465,6 +529,7 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
     }
     const text = textOf(message)
     if (text.trim().length === 0 || isInjectedContext(message)) continue
+    if (isJobNotice(message)) continue
     const notice = message.source.kind === 'plugin' && message.source.form === 'notice'
       ? message.source.summary
       : undefined

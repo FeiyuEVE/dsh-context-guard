@@ -146,27 +146,87 @@ describe('extractFacts', () => {
     expect(facts.errors).toEqual(['bash: bash: line 1: ps: command not found'])
   })
 
-  it('keeps shell noise and document extensions out of the concepts', () => {
+  it('keeps shell noise, file extensions and diagnostic verbs out of the concepts', () => {
     const facts = extractFacts([
       assistant('干活', [
         { id: 'c1', name: 'bash', args: { command: 'cd /w && git status' } },
         { id: 'c2', name: 'read', args: { file_path: '/w/README.md' } },
         { id: 'c3', name: 'read', args: { file_path: '/w/notes.txt' } },
         { id: 'c4', name: 'read', args: { file_path: '/w/src/index.ts' } },
+        { id: 'c5', name: 'read', args: { file_path: '/w/package.json' } },
       ]),
     ])
     expect(facts.concepts).not.toContain('cd')
+    // A real digest read `git, ts, js, json, npm, docker`: the tooling is worth
+    // carrying, but the extensions of files that 涉及文件 already lists in full
+    // retrieve nothing.
+    expect(facts.concepts).toContain('git')
+    expect(facts.concepts).not.toContain('ts')
+    expect(facts.concepts).not.toContain('json')
     expect(facts.concepts).not.toContain('md')
     expect(facts.concepts).not.toContain('txt')
-    // A real technology still registers, and so does a code extension.
-    expect(facts.concepts).toContain('git')
-    expect(facts.concepts).toContain('ts')
     // Diagnostic verbs are noise too: a container run listed `ps` as a
     // 关键技术概念 after the session ran `ps aux` once.
     const probe = extractFacts([
       assistant('看看', [{ id: 'c1', name: 'bash', args: { command: 'ps aux' } }]),
     ])
     expect(probe.concepts).not.toContain('ps')
+    // `for` opens a construct rather than naming a program, and the first word
+    // of a command may be an assignment. A replay of a real region listed both
+    // `for` and `p=/home/…/@feiyueve/dsh-context-guard;` as 关键技术概念.
+    const shell = extractFacts([
+      assistant('批量', [
+        { id: 'c1', name: 'bash', args: { command: 'for p in a b; do systemctl status "$p"; done' } },
+        { id: 'c2', name: 'bash', args: { command: 'p=/home/w/node_modules/@feiyueve/x; echo "$p"' } },
+        { id: 'c3', name: 'bash', args: { command: 'systemctl restart dsh-web' } },
+      ]),
+    ])
+    expect(shell.concepts).not.toContain('for')
+    expect(shell.concepts).not.toContain('p=/home/w/node_modules/@feiyueve/x;')
+    // A program that really is the head of a command is still a technology.
+    expect(shell.concepts).toContain('systemctl')
+  })
+
+  it('does not read a grep line number as a diagnostic', () => {
+    // Real defect: a digest listed
+    // `bash: 38:### [2026-09-12] … 报错判据收严` under 报错与修复. That is a
+    // changelog *heading* which happens to contain the word 报错; it matched
+    // only because the `grep -n` line number in front of it had the `name:`
+    // shape. A count is not a program.
+    const facts = extractFacts([
+      assistant('查标题', [{ id: 'c1', name: 'bash', args: { command: 'grep -n 报错 CHANGES.md' } }]),
+      toolResult('38:### [2026-09-12] dsh-context-guard 0.3.8–0.3.10：交接声明块带体积、报错判据收严'),
+    ])
+    expect(facts.errors).toEqual([])
+  })
+
+  it('drops failures the very next step clears by retrying', () => {
+    // Real defect: five of one digest's six 报错与修复 bullets were these. They
+    // carry `isError: true`, so the flag alone keeps them — but the agent fixed
+    // each by re-issuing the call, and a reader learns nothing.
+    const facts = extractFacts([
+      assistant('改代码', [{ id: 'c1', name: 'edit', args: { file_path: '/w/src/a.ts' } }]),
+      toolResult('Error: cannot modify "/w/src/a.ts": file has not been read — read the file, then retry', true),
+      assistant('再试', [{ id: 'c2', name: 'edit', args: { file_path: '/w/src/b.ts' } }]),
+      toolResult('Error: old_string was not found in "/w/src/b.ts"', true),
+    ])
+    expect(facts.errors).toEqual([])
+  })
+
+  it('does not read a background-job notice as a human request', () => {
+    // Real defect: a digest opened 主要意图 with `bash cd … && sed …` — the
+    // *command line* a `tool-jobs` completion notice carries as its summary —
+    // and pushed the human's actual question to second place.
+    const facts = extractFacts([
+      user('重启了吗？怎么样？'),
+      user('background job bash-3 (bash: cd /w && sed s/a/b/ f.txt) finished [status: completed]', {
+        kind: 'plugin',
+        plugin: 'tool-jobs',
+        form: 'notice',
+        summary: 'bash cd /w && sed s/a/b/ f.txt',
+      }),
+    ])
+    expect(facts.intents).toEqual(['重启了吗？怎么样？'])
   })
 
   it('drops host-re-injected context and prior frames', () => {
