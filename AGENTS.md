@@ -85,6 +85,9 @@ npm run verify      # typecheck && test && build（顺序固定）
 ## 关键约定
 
 - **客户端 bundle id 必须等于 npm 包名**；改客户端半边必须用真实浏览器验证。
+- **设置分节的保存行必须贴底常驻**（`position:sticky; bottom:0`，且保存状态与按钮同容器）：本分节
+  15 项、手机上高约 2100px，而宿主设置弹窗的滚动窗口只有 ~511px，保存排在最末等于手机上按不到。
+  贴底行与宿主滚动窗口 padding 之间的缝及围裙高度，见 `docs/gotchas.md`「客户端半边」末条。
 - **`lib/` 是 gitignored 构建产物**，无 `prepare`/`prepublishOnly`：发布前必须走 `npm run verify`，
   发版即 `npm run verify && npm publish`。
 - **构建顺序固定**：`tsdown`（`clean: true` 会清空 `lib/`）→ `scripts/build.mjs`。
