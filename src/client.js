@@ -131,6 +131,13 @@ window.__ModuleLoader__.load({
       // 状态在左、按钮在右：长报错文案要能换行，且不许把按钮挤扁（flex 收缩默认允许）。
       '.cg-actions>.cg-status{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}',
       '.cg-actions>.cg-btn{flex:0 0 auto}',
+      // 贴底行的底边对齐的是滚动窗口的**内容盒**底边，不含它自己的 padding-bottom
+      // （staging 实测宿主 `._7kpBWW_options` 是 24px），于是保存行下方会露出 24px 正在滚过去的
+      // 正文（实测露出下一组的标题）。
+      // 围裙高度必须**正好等于**宿主那段 padding：矮了缝盖不住，高了会多出可滚动余量
+      // （绝对定位的后代同样计入滚动溢出，40px 实测多出 12px，滚到底会多出一截空白）。
+      // 24px 落在宿主 padding 内，缝盖住、溢出为零；短面板不滚动时它落在窗口内边距里，无副作用。
+      '.cg-actions::after{content:"";position:absolute;left:-4px;right:-4px;top:100%;height:24px;background:inherit}',
       // 窄屏（手机 WebView 的 CSS 视口约 380–430px）一律单列：两列时每格只剩 ~180px，
       // 标签折成两三行、下拉被截断、说明文字变成窄条。这里按视口宽度收口（宽屏设置
       // 弹窗视口仍 ≥1000px，两列观感不变），比按容器宽度判断更可预期。
