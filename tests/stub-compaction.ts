@@ -26,6 +26,12 @@ export class StubCompactionEngine extends CompactionEngine {
   compactNowCalls: number[] = []
   /** When set, the next `compactNow` lands a failed transaction and throws. */
   failNext = false
+  /**
+   * Text of the checkpoint frame this stub lands. A real backend's summary is
+   * whatever its engine returned — this engine's deterministic pointer frame,
+   * or (for `compaction-basic`) a model-written summary in prose.
+   */
+  summaryText = 'stub summary of the compacted range'
 
   override async compactIfNeeded(
     _agent: CompactionAgentContext,
@@ -62,7 +68,7 @@ export class StubCompactionEngine extends CompactionEngine {
       const start = shadowedSeqs[0]!
       const end = shadowedSeqs[1]!
       const compactionId = CompactionId(`stub-${this.compactNowCalls.length}`)
-      const summary = [{ type: 'text' as const, text: 'stub summary of the compacted range' }]
+      const summary = [{ type: 'text' as const, text: this.summaryText }]
       const startEvent = session.append('compaction/start', { compactionId, turn: null })
       const summaryEvent = session.append('compaction/summary', {
         compactionId,

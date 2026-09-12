@@ -45,6 +45,7 @@ import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-settings'
 import {
   DIGEST_FORMAT_VERSION,
+  FRAME_MARKER,
   carriedFrom,
   composeDigest,
   digestPathFrom,
@@ -519,7 +520,7 @@ export class ArchiveCutEngine extends BasicCompactionEngine {
    * to read back, so saving that round-trip is worth ~20 tokens).
    */
   private frameText(artifacts: Artifacts): string {
-    const lines = ['本段历史已由 dsh-context-guard 确定性归档（未调用模型摘要请求）。']
+    const lines = [`${FRAME_MARKER}（未调用模型摘要请求）。`]
     if (artifacts.digestPath !== undefined) lines.push(`- 精简接力摘要：\`${artifacts.digestPath}\``)
     if (artifacts.rawPath !== undefined) lines.push(`- 完整归档：\`${artifacts.rawPath}\``)
     const facts = artifacts.facts

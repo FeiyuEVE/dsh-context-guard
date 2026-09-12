@@ -255,4 +255,29 @@ describe('digestPathFrom', () => {
       .toBe('/w/.handoff/sessions/a1/epoch-2.digest.md')
     expect(digestPathFrom('没有引用')).toBeUndefined()
   })
+
+  it('ignores a bare filename: prose mentions a digest without pointing at one', () => {
+    expect(digestPathFrom('归档为 `epoch-N.digest.md`')).toBeUndefined()
+    expect(digestPathFrom('落点 `epoch-12.digest.md` 与 `latest-digest.txt`')).toBeUndefined()
+  })
+
+  it('ignores archive-looking prose in a model-written checkpoint summary', () => {
+    // Verbatim shape from a real compaction on 2026-09-12 (session
+    // session-30535614…, `standard` preset → `compaction-basic`): the summary
+    // is ordinary text that quotes the format docs, and the guard used to
+    // resolve `epoch-N.digest.md` out of it as if the engine had written it.
+    const foreignSummary = [
+      '- 手动 `/compact` 走同一个 `summarize()` → 写 `epoch-N.raw.md` + `epoch-N.digest.md`，编号递增。',
+      '- 磁盘现状：`.handoff/sessions/` 为空，299 个 flat `*.raw.md`，`latest.txt` → `epoch-299.raw.md`。',
+    ].join('\n')
+    expect(digestPathFrom(foreignSummary)).toBeUndefined()
+  })
+
+  it('takes the last absolute path when a frame names several', () => {
+    const frame = [
+      '- 精简接力摘要：`/w/.handoff/sessions/a1/epoch-1.digest.md`',
+      '- 继承自：`/w/.handoff/sessions/a1/epoch-2.digest.md`',
+    ].join('\n')
+    expect(digestPathFrom(frame)).toBe('/w/.handoff/sessions/a1/epoch-2.digest.md')
+  })
 })

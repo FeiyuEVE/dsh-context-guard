@@ -78,6 +78,8 @@ npm run verify      # typecheck && test && build（顺序固定）
   发版即 `npm run verify && npm publish`。
 - **构建顺序固定**：`tsdown`（`clean: true` 会清空 `lib/`）→ `scripts/build.mjs`。
 - **归档落点**：`<archiveDir 或 cwd>/.handoff/sessions/<完整会话id>/`；写失败仅 warn 不抛。
+- **续跑提示里的路径必须为真**：只从本引擎的指针帧取（帧首 `FRAME_MARKER` 标记归属，外域摘要一律不认）、
+  只收绝对路径、取到后落盘确认；否则模板渲染成「本次未生成摘要文件 / 归档文件」。
 - **日志一律走 `createLogSink`**（`ctx.logger` + console 双投递），字段不含正文。
 - **配置优先级处处一致**：`settings 用户层 > 组合 config > 内置默认`；解析结果含空字符串都必须照用。
 

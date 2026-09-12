@@ -35,7 +35,7 @@
  * @module dsh-context-guard
  */
 
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -48,7 +48,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import type {} from '@deepseek-ai/dsh-settings'
-import { DIGEST_FORMAT_VERSION, digestPathFrom, estimateTextTokens } from './digest.ts'
+import { DIGEST_FORMAT_VERSION, FRAME_MARKER, digestPathFrom, estimateTextTokens } from './digest.ts'
 import { createLogSink, logInfo, logWarn } from './log.ts'
 import { digestPointerCandidates } from './paths.ts'
 import {
@@ -188,10 +188,27 @@ function pickTemplate(settingValue: string | undefined, configValue: string | un
   return configValue ?? builtin
 }
 
-/** Absolute path of a raw archive referenced anywhere in one frame text. */
+/**
+ * Absolute path of a raw archive referenced anywhere in one frame text.
+ *
+ * Absolute-only, like {@link digestPathFrom}: a bare `epoch-N.raw.md` in prose
+ * is a filename pattern, not a file this session wrote.
+ */
 function rawPathFrom(text: string): string | undefined {
-  const fenced = [...text.matchAll(/`([^`\n]*\.raw\.md)`/g)].map(match => match[1] ?? '')
+  const fenced = [...text.matchAll(/`([^`\n]*\.raw\.md)`/g)]
+    .map(match => match[1] ?? '')
+    .filter(candidate => path.isAbsolute(candidate))
   return fenced.length > 0 ? fenced[fenced.length - 1] : undefined
+}
+
+/** The candidate itself when it is an existing regular file, else undefined. */
+async function existingFile(candidate: string | undefined): Promise<string | undefined> {
+  if (candidate === undefined) return undefined
+  try {
+    return (await stat(candidate)).isFile() ? candidate : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -350,11 +367,16 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   /**
-   * The digest the backend wrote for one compaction: taken from the checkpoint
+   * The digest this engine wrote for one compaction: taken from the checkpoint
    * frame (authoritative and configuration-independent), else probed from the
    * default archive base as a fallback.
+   *
+   * A frame without {@link FRAME_MARKER} is not this engine's pointer frame but
+   * another compaction engine's summary — ordinary prose that may quote
+   * archive-looking text — so it can vouch for no digest at all.
    */
   async function digestPathFor(agent: Agent, frame: string): Promise<string | undefined> {
+    if (!frame.includes(FRAME_MARKER)) return undefined
     const fromFrame = digestPathFrom(frame)
     if (fromFrame !== undefined) return fromFrame
     const cwd = agent.session.header?.cwd
@@ -409,8 +431,13 @@ export function apply(ctx: Context, config: Config = {}): void {
       const template = pickTemplate(resolved.resumePromptTemplate, resumePrompt, DEFAULT_RESUME_PROMPT)
       if (template.length === 0) return
       const frame = checkpointText(agent.session, compactionId)
-      const digestPath = await digestPathFor(agent, frame)
-      const rawPath = rawPathFrom(frame)
+      // Only the deterministic frame this engine returns describes real
+      // archives; a foreign summary's paths are prose. Every pointer is then
+      // re-checked against the filesystem, so the prompt never names a file
+      // that is not there.
+      const ownsFrame = frame.includes(FRAME_MARKER)
+      const digestPath = await existingFile(ownsFrame ? await digestPathFor(agent, frame) : undefined)
+      const rawPath = await existingFile(ownsFrame ? rawPathFrom(frame) : undefined)
       const pace = compactionPace(agent.session, Date.now(), resolved.resumeWindowMinutes)
       const delegation = availableToolNames(agent.session)
         .filter(tool => delegationTools.includes(tool))

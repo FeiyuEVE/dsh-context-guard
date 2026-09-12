@@ -73,6 +73,22 @@
   digest 是纯浪费。格式契约改动必须 bump `DIGEST_FORMAT_VERSION`（见 `docs/digest-format.md` §8）。
 - **归属行不能逐次累积**：digest「压缩说明」里 per-epoch 的归属行要在继承时按前缀过滤掉，否则每次
   压缩多加一行（实测 4 次压缩 4 行）。形状未变，无需 bump 格式版本（`EPOCH_NOTE_PREFIX`）。
+- **别把「帧里的路径」当成文件（2026-09-12 线上会话发现并修复）**：续跑提示解析归档路径时，原实现
+  从「压缩帧」里正则抓反引号内的 `*.digest.md`/`*.raw.md`。**只有本引擎的帧才是路径清单**；其他引擎
+  的帧是模型写的摘要，正文里什么都可能出现 —— 实测 `standard` preset（`compaction-basic`）的会话
+  摘要抄了 `docs/digest-format.md` 的占位符与磁盘现状，于是续跑提示注入了并不存在的
+  `` `epoch-N.digest.md` `` 和别的会话的 `epoch-299.raw.md`（复现：把真实摘要喂给那两条正则，
+  digest 候选 `["epoch-N.digest.md","epoch-N.digest.md"]`、raw 末位 `epoch-299.raw.md`，双双
+  `isAbsolute=false`）。三道闸门现在缺一不可：
+  1. **帧标记**（`FRAME_MARKER`，帧首固定句）—— 非本引擎的帧一律不认，连指针探测都不做；
+  2. **只收绝对路径** —— 裸文件名是「提及」不是「指向」；
+  3. **落盘确认**（`existingFile`）—— 路径必须真是文件，否则模板退回
+     「（本次未生成摘要文件 / 归档文件）」。
+  回归用例：`tests/context-guard.spec.ts` 的 `resume archive pointers`（含外域摘要、真文件、文件已删
+  三种）与 `tests/digest.spec.ts` 的 `digestPathFrom`。**排查口径**：非归档引擎的会话「没有归档」是
+  正常态（`agentPreset: standard` → `compaction-basic`，事件里 `provider=deepseek-official`、
+  `maxTokens=8192`；本引擎是 `provider=context-guard`、`maxTokens=0`），此时 `.handoff/sessions/`
+  为空不是缺陷。
 
 ## 日志
 

@@ -29,10 +29,23 @@
  * @module dsh-context-guard/digest
  */
 
+import path from 'node:path'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 
 /** Version of the digest document format. */
 export const DIGEST_FORMAT_VERSION = 1
+
+/**
+ * Opening words of every pointer frame the archive-cut engine returns.
+ *
+ * The guard matches on this marker to tell its own deterministic frame apart
+ * from a *foreign* compaction summary (any other engine's, e.g. the
+ * model-written one from `compaction-basic`). The distinction is
+ * load-bearing: a summary is ordinary prose and may quote archive-looking
+ * text — a doc placeholder such as `epoch-N.digest.md`, a path mentioned in
+ * passing — and those quoted strings are not artifacts of this session.
+ */
+export const FRAME_MARKER = '本段历史已由 dsh-context-guard 确定性归档'
 
 /** First line of every digest; carries the format version. */
 export const DIGEST_MARKER = `<!-- context-guard-digest v${DIGEST_FORMAT_VERSION} -->`
@@ -679,11 +692,19 @@ export function carriedFrom(parsed: ParsedDigest | undefined): Map<string, strin
   return carried
 }
 
-/** Absolute path of a digest referenced anywhere in one text. */
+/**
+ * Absolute path of a digest referenced anywhere in one text.
+ *
+ * Only absolute candidates count. Prose mentions a digest by bare filename
+ * (the `epoch-N.digest.md` of the format docs, `epoch-12.digest.md` in a
+ * checkpoint summary), and treating those as paths invents files that were
+ * never written.
+ */
 export function digestPathFrom(text: string): string | undefined {
   const fenced = [...text.matchAll(/`([^`\n]*\.digest\.md)`/g)].map(match => match[1] ?? '')
-  const candidates = fenced.length > 0
+  const candidates = (fenced.length > 0
     ? fenced
-    : [...text.matchAll(/(\/[^\s`'"，。]*\.digest\.md)/g)].map(match => match[1] ?? '')
+    : [...text.matchAll(/(\/[^\s`'"，。]*\.digest\.md)/g)].map(match => match[1] ?? ''))
+    .filter(candidate => path.isAbsolute(candidate))
   return candidates.length > 0 ? candidates[candidates.length - 1] : undefined
 }

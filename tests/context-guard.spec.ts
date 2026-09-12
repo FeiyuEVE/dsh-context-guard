@@ -6,7 +6,10 @@
  * configuration switches.
  */
 
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
@@ -18,6 +21,7 @@ import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import * as ContextGuard from '../src/index.ts'
 import type { Config } from '../src/index.ts'
+import { FRAME_MARKER } from '../src/digest.ts'
 import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
 import type { ScriptEntry } from './mock-adapter.ts'
 import { StubCompactionEngine } from './stub-compaction.ts'
@@ -572,6 +576,113 @@ describe('template precedence over the settings layer', () => {
     )
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
     expect(guardMessages(agent).some(m => m.text.includes('配置层收尾提醒'))).toBe(true)
+    void ctx
+  })
+})
+
+/**
+ * What the continuation may claim about archives.
+ *
+ * The default template names two files (`{{digest}}` / `{{raw}}`), so a wrong
+ * resolution is not a cosmetic log line: it sends the resumed agent to read a
+ * file that does not exist. A session on `compaction-basic` (the `standard`
+ * preset, i.e. every ordinary web session) never writes either file, and its
+ * "frame" is a model-written summary in prose.
+ */
+describe('resume archive pointers', () => {
+  const tmpDirs: string[] = []
+  afterEach(async () => {
+    await Promise.all(tmpDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
+  })
+
+  /** Cut once (wide threshold: the guard itself never compacts) and read the continuation. */
+  async function cutOnceAndResume(
+    compaction: StubCompactionEngine,
+    agent: Agent,
+    adapter: MockAdapter,
+  ): Promise<string> {
+    expect(await compaction.compactNow(agent, new AbortController().signal)).not.toBeNull()
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(2)
+      expect(agent.status).toBe('idle')
+    })
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(1)
+    return messages[0]!.text
+  }
+
+  it('names no file when the frame is a foreign (model-written) summary', async () => {
+    const { ctx, agent, compaction, adapter } = await harness(
+      [textResponse('first'), textResponse('resumed')],
+      {},
+      4000,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    // The real defect (2026-09-12): a `standard`-preset session's summary
+    // quoted the format docs, and the guard injected `epoch-N.digest.md`.
+    compaction!.summaryText = [
+      '手动 `/compact` 走同一个 `summarize()` → 写 `epoch-N.raw.md` + `epoch-N.digest.md`。',
+      '磁盘现状：`.handoff/sessions/` 为空，`latest.txt` → `epoch-299.raw.md`。',
+    ].join('\n')
+
+    const text = await cutOnceAndResume(compaction!, agent, adapter)
+    expect(text).toContain('（本次未生成摘要文件）')
+    expect(text).toContain('（本次未生成归档文件）')
+    expect(text).not.toContain('epoch-N.digest.md')
+    expect(text).not.toContain('epoch-299.raw.md')
+    void ctx
+  })
+
+  it('names the engine frame\'s artifacts when they exist on disk', async () => {
+    const { ctx, agent, compaction, adapter } = await harness(
+      [textResponse('first'), textResponse('resumed')],
+      {},
+      4000,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'cg-pointers-'))
+    tmpDirs.push(dir)
+    const digest = path.join(dir, 'epoch-1.digest.md')
+    const raw = path.join(dir, 'epoch-1.raw.md')
+    await writeFile(digest, 'digest body', 'utf8')
+    await writeFile(raw, 'raw body', 'utf8')
+    compaction!.summaryText = [
+      `${FRAME_MARKER}（未调用模型摘要请求）。`,
+      `- 精简接力摘要：\`${digest}\``,
+      `- 完整归档：\`${raw}\``,
+    ].join('\n')
+
+    const text = await cutOnceAndResume(compaction!, agent, adapter)
+    expect(text).toContain(digest)
+    expect(text).toContain(raw)
+    expect(text).not.toContain('（本次未生成摘要文件）')
+    void ctx
+  })
+
+  it('withholds a pointer whose file is gone, even in the engine frame', async () => {
+    const { ctx, agent, compaction, adapter } = await harness(
+      [textResponse('first'), textResponse('resumed')],
+      {},
+      4000,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    compaction!.summaryText = [
+      `${FRAME_MARKER}（未调用模型摘要请求）。`,
+      '- 精简接力摘要：`/nonexistent-cg/epoch-7.digest.md`',
+    ].join('\n')
+
+    const text = await cutOnceAndResume(compaction!, agent, adapter)
+    expect(text).toContain('（本次未生成摘要文件）')
+    expect(text).not.toContain('/nonexistent-cg/epoch-7.digest.md')
     void ctx
   })
 })
