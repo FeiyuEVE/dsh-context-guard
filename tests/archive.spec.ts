@@ -172,3 +172,51 @@ describe('writeArchive', () => {
     expect(lines.some(line => line.includes('write-failed'))).toBe(true)
   })
 })
+
+/**
+ * A control byte anywhere in a written document makes the Web preview refuse the
+ * whole file (`workspace-file/not-text` → 「非文本文件，暂时无法预览。」), because
+ * the workspace-files reader checks the entire returned page for NUL. Tool
+ * results carry those bytes for real — dumping `/proc/<pid>/cmdline` separates
+ * arguments with NUL — so the writer, not each renderer, has to guarantee the
+ * documents it produces are NUL-free.
+ */
+describe('archive text hygiene', () => {
+  it('writes no NUL byte even when a message carries one', async () => {
+    const base = await makeTmpDir()
+    const { log } = captureLog()
+    const artifacts = await writeArchive({
+      base,
+      layout: 'session',
+      epochPrefix: 'epoch',
+      sessionId: 'a1',
+      messages: [message('before\u0000after'), message('tail')],
+      config: resolveDigestConfig(undefined),
+      log,
+      logScope: 'sidecar',
+    })
+    const raw = await readFile(artifacts.rawPath as string)
+    expect(raw.includes(0)).toBe(false)
+    const text = raw.toString('utf8')
+    expect(text).toContain('before␀after')
+    expect(text).toContain('tail')
+  })
+
+  it('strips ANSI colour escapes from tool output', async () => {
+    const base = await makeTmpDir()
+    const { log } = captureLog()
+    const artifacts = await writeArchive({
+      base,
+      layout: 'session',
+      epochPrefix: 'epoch',
+      sessionId: 'a1',
+      messages: [message('\u001b[1;34m==> checking\u001b[0m done')],
+      config: resolveDigestConfig(undefined),
+      log,
+      logScope: 'sidecar',
+    })
+    const text = await readFile(artifacts.rawPath as string, 'utf8')
+    expect(text).not.toContain('\u001b')
+    expect(text).toContain('==> checking done')
+  })
+})

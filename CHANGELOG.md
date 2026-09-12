@@ -4,6 +4,26 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.3.7] - 2026-09-12
+
+### 修复
+
+- **归档文档不再写进控制字节，Web 预览不再拒绝整份文件**。0.3.6 的 raw 归档逐字复制消息与工具结果
+  文本，而工具结果里**合法地**带着控制字节：打印 `/proc/<pid>/cmdline` 的命令会输出 NUL 分隔符，
+  多数 CLI 又用 ANSI 颜色包裹输出。只要有**一个 NUL**，阅读路径就整体失败：
+  - `@deepseek-ai/dsh-fs-local` 对「前 8192 字节含 NUL」直接判为二进制（`FS_NOT_TEXT`, binary file）；
+  - `@deepseek-ai/dsh-api-workspace-files` 更严，对**返回页整段**再查一次 NUL，抛
+    `workspace-file/not-text`，Web 侧文档预览把它渲染成「**非文本文件，暂时无法预览。**」
+    —— 于是最需要打开的那份交接文档，反而一个字都看不到。
+  现在所有归档写盘都过 `writeAtomic` → `sanitizeDocText()`：剥掉 ANSI 转义序列、把 CRLF/CR 归一成
+  LF、把 NUL 渲染成可见的 `␀`、丢掉其余 C0 与 DEL（保留 `\t`/`\n`）。规则收在写盘器这一处，所以
+  「归档不可能带 NUL」是**写入方的性质**，不再依赖每个渲染器各自记得。
+
+### 变更
+
+- 归档文档的**文本卫生是有损的、且已界定**：只影响控制字节与转义序列，正文一字不动；**逐字节的原始
+  记录仍是会话日志**（`sessions/<id>/session.v3.jsonl.zstd`）。这条写进了 `docs/gotchas.md`。
+
 ## [0.3.6] - 2026-09-12
 
 ### 变更

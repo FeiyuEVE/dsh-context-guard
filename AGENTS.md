@@ -58,9 +58,10 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
 | `src/resume-prompt.ts` | 纯函数提示词渲染：`decideResume`(L0–L3)、`archiveClause`（`{{archive}}` 交接文档声明块）、`buildWrapUpPrompt`、内置默认模板 |
 | `src/session-facts.ts` | 结构化读会话：压缩节奏、可用委派工具、待办、最后一次人类意图 |
 | `src/messages-to-md.ts` | 纯函数清洗：会话区段 → Markdown（无 I/O、无时间戳、可 golden 测试） |
+| `src/sanitize.ts` | 归档文本卫生：剥 ANSI、CR→LF、NUL→`␀`、丢其余 C0/DEL（写盘器统一调用） |
 | `src/log.ts` | 单行日志 sink：`context-guard[/scope]: event k=v`，同时投递 `ctx.logger` 与 console |
 | `src/client.js` | 浏览器端源码：`settings.section`「上下文守卫」三组表单 |
-| `tests/` | vitest：9 个 spec + mock adapter / stub 引擎，无网络 |
+| `tests/` | vitest：11 个 spec + mock adapter / stub 引擎，无网络 |
 | `docs/digest-format.md` | digest 格式契约（结构、抽取口径、预算梯度、继承、版本规则、边界） |
 | `docs/gotchas.md` | 工程坑与历史教训（构建发布、settings 优先级、归档、日志） |
 | `cordis.patch.yml` | bundle patch：只 insert 一行 `context-guard` → `@feiyueve/dsh-context-guard` |
@@ -88,6 +89,11 @@ npm run verify      # typecheck && test && build（顺序固定）
   发版即 `npm run verify && npm publish`。
 - **构建顺序固定**：`tsdown`（`clean: true` 会清空 `lib/`）→ `scripts/build.mjs`。
 - **归档落点**：`<archiveDir 或 cwd>/.handoff/sessions/<完整会话id>/`；写失败仅 warn 不抛。
+- **归档必须无 NUL**（0.3.7 起）：所有归档写盘都经 `writeAtomic` → `sanitizeDocText()`，剥 ANSI、CR→LF、
+  NUL→`␀`、丢其余 C0/DEL。原因是**一个 NUL 就让 Web 文档预览拒开整份文件**（`workspace-file/not-text`
+  →「非文本文件，暂时无法预览。」），而工具结果里带 NUL 是常态（`/proc/<pid>/cmdline` 用 NUL 分隔）。
+  规则放在写盘器、不放渲染器：新增渲染路径自动受保护。**代价**：raw 不再是逐字节无损，逐字节原文
+  在会话日志里。新增/修改归档渲染时，用例必须同时断言「无 NUL」与「无残留 ANSI」。
 - **接力笔记同落点**：收尾提示词的 `{{notePath}}` = 该会话目录下的 `epoch-<即将这次序号>.handoff.md`
   （序号 = 本会话压缩总数 + 1，与续跑提示 `{{epoch}}` 同一事实源），标题要求
   `# 第 N 次压缩 · 接力笔记 · <主题>`；守卫只算路径、不建目录（`write` 工具自建父目录），

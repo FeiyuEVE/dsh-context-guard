@@ -332,6 +332,10 @@ npm run verify      # 三者全跑
   多等几毫秒同步 I/O；归档盘卡住会拖住压缩调用方。旁挂落点是会话的 `<cwd>/.handoff`（host 半边没有
   `archiveDir` 开关，那是压缩引擎行才有的字段），所以把工作区放在慢速网络盘上时，这份等待会跟着变长。
 - digest 含用户文本与路径：父仓库 `.gitignore` 已 ignore `.handoff/sessions/`。
+- **归档文档做文本卫生，因此不是逐字节无损**（0.3.7 起）：NUL 渲染成 `␀`、ANSI 转义序列剥掉、
+  CR 归一成 LF、其余 C0 与 DEL 丢弃（保留 `\t`/`\n`）。原因是只要有一个 NUL，Web 文档预览就会把
+  整份文件判为「非文本文件，暂时无法预览。」（`workspace-file/not-text`）—— 归档恰恰是最需要能打开
+  的那份文档。逐字节的原始记录仍是会话日志 `sessions/<id>/session.v3.jsonl.zstd`。
 - 同一会话的并发压缩靠 guard 的 `compacting` 标记串行化；跨进程并发写同一会话仍未加文件锁。
 
 ## License

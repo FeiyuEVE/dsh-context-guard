@@ -121,6 +121,23 @@
   提示词，落点都得由知道 id 的一方给出，别让模型自己编路径。
   另一个可选细节：`write` 工具（`fs-local/src/fsio.ts:581`）会 `mkdir -p` 父目录，所以插件不必预建目录 ——
   空目录因此仍是「该会话从未归档」的可判据。
+- **归档里的控制字节会让整份文档打不开（2026-09-12 用户提问发现）**：用户点开 raw 归档，Web 预览显示
+  「**非文本文件，暂时无法预览。**」。这不是大小或路径问题，而是**一个 NUL 字节**。两条阅读路径各查一次：
+  - `@deepseek-ai/dsh-fs-local/lib/index.js:355`（及流式读的 `:441`）：`raw.subarray(0, 8192).includes(0)`
+    → `FS_NOT_TEXT`（"binary file"）。**只查前 8192 字节**；
+  - `@deepseek-ai/dsh-api-workspace-files/lib/index.js:403`：`page.text.includes(NUL)`
+    → `workspace-file/not-text`。**查返回页整段**，所以 NUL 落在文件任何位置都会命中；Web 侧
+    `dsh-client-ui-sidebar-documentpreview` 的 `failureLine()` 把它渲染成上面那句话
+    （键 `error.notText`）。
+  字节从哪来：raw 归档逐字复制工具结果，而工具结果**合法地**含控制字节 —— 实测 6 个 NUL 全部来自
+  「打印 `/proc/<pid>/cmdline`」这类命令（`cmdline` 以 NUL 分隔参数），另有 44 个 `0x1b` 是 CLI 的
+  ANSI 颜色。会话日志里它们存成 JSON 转义 `\u0000`（`session.v3.jsonl.zstd` 中 87 行），`JSON.parse`
+  之后就是真 NUL，renderer 原样写进 `.md` 就中招。
+  修法在**写盘器这一处**（`writeAtomic` → `sanitizeDocText()`），而不是每个渲染器各自记得：
+  「归档不可能带 NUL」因此是写入方的性质。规则与边界见 `src/sanitize.ts`：剥 ANSI、CR→LF、NUL→`␀`、
+  丢其余 C0/DEL（留 `\t`/`\n`）。**代价是 raw 不再是逐字节无损**；逐字节原文仍在会话日志里。
+  **排查口径**：`python3 -c "print(open(p,'rb').read().count(b'\x00'))"`，或
+  `grep -c $'\x00' <file>`；改归档渲染后要同时看「文件里有没有 NUL」和「有没有残留 `[1;34m`」。
 
 ## 日志
 

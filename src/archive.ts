@@ -48,6 +48,7 @@ import type { LogSink } from './log.ts'
 import { messagesToMarkdown } from './messages-to-md.ts'
 import { LATEST_DIGEST_POINTER, LATEST_POINTER, archiveLocation } from './paths.ts'
 import type { ArchiveLayout, ArchiveLocation } from './paths.ts'
+import { sanitizeDocText } from './sanitize.ts'
 import type { ResolvedDigestConfig } from './settings.ts'
 
 /** Everything one compaction wrote, for a pointer frame, a record, or a log line. */
@@ -106,10 +107,18 @@ export interface ArchiveRequest {
   regionTokens?: number | undefined
 }
 
-/** Write one file atomically (tmp + rename) so readers never see a partial document. */
+/**
+ * Write one file atomically (tmp + rename) so readers never see a partial
+ * document, after text hygiene.
+ *
+ * Every archive write goes through here, which is what makes "no archive can
+ * carry a NUL byte" a property of the writer rather than a promise each renderer
+ * has to keep: a single NUL makes the Web document preview refuse the whole file
+ * as 「非文本文件，暂时无法预览。」. See `./sanitize.ts` for the rule and its bounds.
+ */
 function writeAtomic(file: string, text: string): void {
   const tmp = `${file}.tmp-${process.pid}`
-  writeFileSync(tmp, text, 'utf8')
+  writeFileSync(tmp, sanitizeDocText(text), 'utf8')
   renameSync(tmp, file)
 }
 
