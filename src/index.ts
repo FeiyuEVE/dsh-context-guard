@@ -439,7 +439,20 @@ export function apply(ctx: Context, config: Config = {}): void {
    * only renders prompt text.
    */
   function archiveBase(agent: Agent): string | undefined {
-    const cwd = agent.session.header?.cwd
+    return sessionBase(agent.session)
+  }
+
+  /**
+   * Absolute archive base directory for one session, or undefined when it
+   * exposes no working directory.
+   *
+   * A base that is not absolute is *not* usable for writing: `.handoff` would
+   * resolve against whatever directory the host process happens to run in.
+   * {@link sessionArchiveDir} still falls back to the relative form because it
+   * only renders prompt text.
+   */
+  function sessionBase(session: Session): string | undefined {
+    const cwd = session.header?.cwd
     if (cwd === undefined || cwd.length === 0) return undefined
     return path.join(cwd, '.handoff')
   }
@@ -529,8 +542,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     shadowedSeqs: readonly SessionSeq[],
   ): Promise<Artifacts> {
     try {
-      const agent = ctx.agents.get(session.id)
-      const base = agent === undefined ? archiveBaseFromSession(session) : archiveBase(agent)
+      const base = sessionBase(session)
       if (base === undefined) {
         logWarn(log, 'sidecar', 'skipped', { reason: 'no-cwd', session: String(session.id) })
         return {}
@@ -573,13 +585,6 @@ export function apply(ctx: Context, config: Config = {}): void {
       logWarn(log, 'sidecar', 'failed', { session: String(session.id), error: String(error) })
       return {}
     }
-  }
-
-  /** {@link archiveBase} for a session whose agent is no longer registered. */
-  function archiveBaseFromSession(session: Session): string | undefined {
-    const cwd = session.header?.cwd
-    if (cwd === undefined || cwd.length === 0) return undefined
-    return path.join(cwd, '.handoff')
   }
 
   ctx.on('session/event', (session, event) => {
