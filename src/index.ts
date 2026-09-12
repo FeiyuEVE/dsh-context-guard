@@ -670,6 +670,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         epoch: pace.sessionTotal,
         digestPath,
         rawPath,
+        rawBytes: recorded?.rawBytes,
+        digestTokens: recorded?.digestTokens,
         todos: pendingTodos(agent.session),
         intent: lastHumanIntent(agent.session),
         noteDir: `${sessionArchiveDir(agent)}/`,

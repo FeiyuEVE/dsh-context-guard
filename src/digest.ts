@@ -189,6 +189,37 @@ const WRITE_TOOL = /write|edit|patch|delete|remove|mkdir|move|rename|create/i
 const COMMAND_CONCEPTS = /\b(git|npm|pnpm|yarn|bun|cargo|python|pip|uv|docker|kubectl|helm|make|gradle|maven|curl|terraform)\b/gi
 /** First-line signals of a failure, English and Chinese. */
 const ERROR_LINE = /(error|failed|failure|fatal|exception|enoent|eacces|eperm|denied|refused|not found|cannot |unable |exit code [1-9]|失败|错误|报错|异常|找不到|未找到|不存在|无法|拒绝|超时|崩溃|致命)/i
+/**
+ * Shape of a real diagnostic line: `<something>: message`.
+ *
+ * Needed because {@link ERROR_LINE} alone promotes prose to an error. A
+ * successful tool call whose *output* merely talks about errors was being
+ * reported as one — a real digest listed
+ * `bash: === 该错误是否历史就有（上次重启/更早）===`, an echo banner the agent
+ * printed while investigating. Real diagnostics arrive as `sh: 1: ps: not found`
+ * or `Error: tool call aborted`, which have this shape; banners start with
+ * punctuation and do not.
+ */
+const DIAGNOSTIC_LINE = /^[\w.+-]{1,32}:\s*\S/
+/** Command heads that say nothing about the work: shell builtins and navigation. */
+const COMMAND_NOISE = new Set([
+  'cd', 'ls', 'pwd', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'true', 'false',
+  'test', 'sleep', 'env', 'export', 'set', 'source', 'which', 'command', 'type',
+  'read', 'sh', 'bash', 'zsh', 'sudo', 'time', 'tee', 'date', 'mkdir', 'rm', 'cp',
+  'mv', 'touch', 'kill', 'seq', 'xargs', 'find', 'sort', 'uniq', 'diff', 'chmod',
+  'ps', 'top', 'df', 'du', 'uname', 'whoami', 'id', 'printenv', 'stat', 'dirname',
+  'basename', 'realpath', 'tr', 'cut', 'nl', 'yes', 'wait', 'jobs', 'trap', 'umask',
+  'ulimit', 'history', 'alias', 'clear', 'exit', 'exec', 'eval', 'unset', 'shift',
+  'return', 'break', 'continue', 'dirs', 'pushd', 'popd', 'mount', 'sync', 'reset',
+  'hostname', 'tty', 'stty', 'ln', 'dd', 'mktemp', 'install',
+])
+/** File extensions that name a document, not a technology. */
+const EXTENSION_NOISE = new Set(['md', 'txt', 'log', 'lock', 'tmp', 'bak', 'map', 'out'])
+/**
+ * Markers a tool wraps captured output in: `[stderr]`, `[stdout]`, `[exit code: N]`.
+ * They are structure, not message — see {@link resultFirstLines}.
+ */
+const STREAM_MARKER = /^\[(?:stdout|stderr|exit code: \d+)\]$/
 /** CJK scripts and full-width forms, priced denser than ASCII. */
 const CJK_CHAR = /[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef\uac00-\ud7af]/g
 
@@ -255,7 +286,15 @@ export function isInjectedContext(message: Message): boolean {
   return form === 'snapshot' || form === 'instructions' || form === 'catalog'
 }
 
-/** First non-empty line of each tool-result block, with its error flag. */
+/**
+ * First *meaningful* line of each tool-result block, with its error flag.
+ *
+ * The stream markers a tool wraps captured output in are skipped: a failing
+ * command arrives as `[stderr]` / `bash: line 1: ps: command not found` /
+ * `[exit code: 127]` with `isError: false`, so taking the literal first line
+ * reads `[stderr]` — which carries no message and matches no error signal, and
+ * every real stderr failure was therefore invisible in 报错与修复.
+ */
 function resultFirstLines(content: readonly ContentBlock[]): { isError: boolean; line: string }[] {
   const lines: { isError: boolean; line: string }[] = []
   for (const block of content) {
@@ -266,7 +305,7 @@ function resultFirstLines(content: readonly ContentBlock[]): { isError: boolean;
       .join('\n')
       .split('\n')
       .map(entry => entry.trim())
-      .find(entry => entry.length > 0)
+      .find(entry => entry.length > 0 && !STREAM_MARKER.test(entry))
     if (line !== undefined) lines.push({ isError: block.isError === true, line })
   }
   return lines
@@ -381,7 +420,9 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
           const extension = /\.([a-z0-9]{1,5})$/i.exec(filePath)
           if (extension !== null) {
             const token = (extension[1] ?? '').toLowerCase()
-            if (token.length > 0 && !facts.concepts.includes(token)) facts.concepts.push(token)
+            if (token.length > 0 && !EXTENSION_NOISE.has(token) && !facts.concepts.includes(token)) {
+              facts.concepts.push(token)
+            }
           }
         }
         const command = argString(parsed, COMMAND_KEYS)
@@ -392,7 +433,9 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
             if (!facts.concepts.includes(token)) facts.concepts.push(token)
           }
           const head = command.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
-          if (head.length > 0 && !facts.concepts.includes(head)) facts.concepts.push(head)
+          if (head.length > 0 && !COMMAND_NOISE.has(head) && !facts.concepts.includes(head)) {
+            facts.concepts.push(head)
+          }
         }
         const key = `${block.name}\u0000${block.arguments}`
         const dup = dupCounts.get(key) ?? { name: block.name, parsed, count: 0 }
@@ -408,7 +451,13 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
     const results = resultFirstLines(message.content)
     if (results.length > 0) {
       for (const result of results) {
-        if (!result.isError && !ERROR_LINE.test(result.line)) continue
+        // A successful call can still print a failure (`sh: 1: ps: not found`),
+        // so a non-error result is only believed when the line also has the
+        // diagnostic shape — otherwise prose that merely mentions an error is
+        // recorded as one. See DIAGNOSTIC_LINE.
+        if (!result.isError && (!ERROR_LINE.test(result.line) || !DIAGNOSTIC_LINE.test(result.line))) {
+          continue
+        }
         const call = message.source.kind === 'tool' ? callsById.get(String(message.source.callId)) : undefined
         facts.errors.push(`${call?.name ?? 'tool'}: ${result.line}`)
       }
@@ -515,18 +564,24 @@ function renderSections(
     ...facts.errors.map(line => clip(line, chars)),
   ]), cap)
 
-  const todos = facts.todos.map(item => clip(item, chars)).slice(0, cap)
+  // The head of the pending list is the immediate next action; the remainder is
+  // the outstanding list. Rendering both without splitting them printed the same
+  // item twice — the last todo appeared as 下一步 *and* inside 未完成待办.
+  const pending = facts.todos.map(item => clip(item, chars))
+  const next = pending[0] ?? '（无）'
+  const todos = pending.slice(1).slice(0, cap)
 
+  // 当前进展 answers "where did things stand". The last user text is *not*
+  // repeated here: it is already the last item of 主要意图, and in a real digest
+  // the same clipped request was the longest line in a 478-token document,
+  // rendered twice. The last assistant message is what carries the state.
   const current: string[] = []
-  if (facts.lastUserText.trim().length > 0) current.push(clip(facts.lastUserText, chars))
-  if (facts.lastAssistantText.trim().length > 0) {
-    current.push(clip(
-      facts.lastAssistantText.split('\n').filter(line => line.trim().length > 0).slice(0, 2).join(' / '),
-      chars,
-    ))
-  }
-
-  const next = facts.todos.length > 0 ? clip(facts.todos[facts.todos.length - 1] ?? '', chars) : '（无）'
+  const lastAssistant = facts.lastAssistantText
+    .split('\n')
+    .filter(line => line.trim().length > 0)
+    .slice(0, 3)
+    .join(' / ')
+  if (lastAssistant.trim().length > 0) current.push(clip(lastAssistant, chars))
 
   // Inherited provenance lines are dropped (see EPOCH_NOTE_PREFIX) so only
   // genuine duplicate-call notes survive across epochs; the current epoch's own

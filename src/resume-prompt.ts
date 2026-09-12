@@ -58,6 +58,18 @@ export interface ResumeFacts {
   digestPath?: string | undefined
   /** Lossless archive of the compacted region, when the backend produced one. */
   rawPath?: string | undefined
+  /**
+   * Size of {@link rawPath} in bytes, when known.
+   *
+   * The raw archive is the complete record of the region, so it is large by
+   * design (measured: 401 messages → 286 KB ≈ 64k tokens, about 59% of the
+   * region it replaces). Stating the size is what keeps the prompt from reading
+   * as an invitation to open it: reading it whole would re-inflate the context
+   * the compaction just cleared.
+   */
+  rawBytes?: number | undefined
+  /** Estimated tokens of the digest named by {@link digestPath}. */
+  digestTokens?: number | undefined
   /** Pending todo items at resume time. */
   todos: string[]
   /** Last direct human request, clipped. */
@@ -104,6 +116,25 @@ function toolList(tools: readonly string[]): string {
   return tools.map(tool => `\`${tool}\``).join(' / ')
 }
 
+/** Byte size a person can read at a glance. */
+function humanBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${bytes} B`
+}
+
+/**
+ * Rough token count of an archive document, so the clause can warn about size.
+ *
+ * Deliberately cheap and approximate (4 bytes per token, rounded to 1k): this
+ * only has to tell the reader "tens of thousands, do not open it whole". The
+ * exact figure the digest itself reports comes from the real estimator.
+ */
+function humanTokens(bytes: number): string {
+  const tokens = Math.ceil(bytes / 4 / 1000) * 1000
+  return tokens >= 1000 ? `≈${Math.round(tokens / 1000)}k` : `≈${tokens}`
+}
+
 /**
  * The handoff-document clause: what this compaction archived, or that it
  * archived nothing.
@@ -116,18 +147,25 @@ function toolList(tools: readonly string[]): string {
  * @param facts - measured facts; `digestPath`/`rawPath` are confirmed to exist.
  */
 export function archiveClause(facts: ResumeFacts): string {
-  const { digestPath, rawPath } = facts
+  const { digestPath, rawPath, rawBytes, digestTokens } = facts
   if (digestPath === undefined && rawPath === undefined) {
     return '本次压缩没有生成归档文档；上面那段摘要就是本次压缩的全部交接内容。'
   }
   const lines = ['本次压缩的交接文档（上一段上下文的归档）：']
   if (digestPath !== undefined) {
-    lines.push(`- 精简接力摘要（建议先读）：\`${digestPath}\``)
+    const size = digestTokens === undefined ? '' : `，约 ${digestTokens} tokens`
+    lines.push(`- 接力摘要（先读这份${size}）：\`${digestPath}\``)
   }
   if (rawPath !== undefined) {
-    lines.push(`- 完整原文归档（需要细节时再读）：\`${rawPath}\``)
+    const size = rawBytes === undefined ? '' : `，约 ${humanBytes(rawBytes)} / ${humanTokens(rawBytes)} tokens`
+    lines.push(`- 完整原文归档（按需检索用，**不要整份读入**${size}）：\`${rawPath}\``)
   }
-  lines.push('不要求通读，但请知道它在那里，需要时可直接 read。')
+  lines.push(
+    rawPath === undefined
+      ? '不要求通读，但请知道它在那里，需要时可直接 read。'
+      : '原文归档是那段历史的完整记录，体量与被压缩掉的上下文相当 —— 整份读进来会把刚腾出的空间又填回去。'
+        + '需要细节时请先 grep 定位，再局部 read 那几段。',
+  )
   return lines.join('\n')
 }
 

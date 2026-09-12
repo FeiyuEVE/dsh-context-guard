@@ -106,6 +106,69 @@ describe('extractFacts', () => {
     ])
   })
 
+  it('does not promote a successful call whose output merely mentions an error', () => {
+    // Real defect: a shipped digest listed
+    // `bash: === 该错误是否历史就有（上次重启/更早）===` under 报错与修复 — an
+    // echo banner the agent printed while investigating. Only the error *word*
+    // matched; the call itself succeeded and printed no diagnostic.
+    const facts = extractFacts([
+      assistant('查一下', [{ id: 'c1', name: 'bash', args: { command: "echo '=== 该错误是否历史就有 ==='" } }]),
+      toolResult('=== 该错误是否历史就有（上次重启/更早）==='),
+    ])
+    expect(facts.errors).toEqual([])
+  })
+
+  it('keeps a real diagnostic printed by a call that exited zero', () => {
+    const facts = extractFacts([
+      assistant('看看进程', [{ id: 'c1', name: 'bash', args: { command: 'ps aux' } }]),
+      toolResult('sh: 1: ps: not found'),
+    ])
+    expect(facts.errors).toEqual(['bash: sh: 1: ps: not found'])
+  })
+
+  it('keeps an error-flagged result whatever its shape', () => {
+    const facts = extractFacts([
+      assistant('跑一下', [{ id: 'c1', name: 'bash', args: { command: 'something' } }]),
+      toolResult('工具调用被中止', true),
+    ])
+    expect(facts.errors).toEqual(['bash: 工具调用被中止'])
+  })
+
+  it('reads past the stream markers a tool wraps output in', () => {
+    // A failing command arrives as `[stderr]` / message / `[exit code: N]` with
+    // isError: false. Taking the literal first line read `[stderr]`, which
+    // matches no error signal — so every real stderr failure was invisible in
+    // 报错与修复 (observed in the container: `ps aux` reported nothing).
+    const facts = extractFacts([
+      assistant('看看进程', [{ id: 'c1', name: 'bash', args: { command: 'ps aux' } }]),
+      toolResult('[stderr]\nbash: line 1: ps: command not found\n[exit code: 127]'),
+    ])
+    expect(facts.errors).toEqual(['bash: bash: line 1: ps: command not found'])
+  })
+
+  it('keeps shell noise and document extensions out of the concepts', () => {
+    const facts = extractFacts([
+      assistant('干活', [
+        { id: 'c1', name: 'bash', args: { command: 'cd /w && git status' } },
+        { id: 'c2', name: 'read', args: { file_path: '/w/README.md' } },
+        { id: 'c3', name: 'read', args: { file_path: '/w/notes.txt' } },
+        { id: 'c4', name: 'read', args: { file_path: '/w/src/index.ts' } },
+      ]),
+    ])
+    expect(facts.concepts).not.toContain('cd')
+    expect(facts.concepts).not.toContain('md')
+    expect(facts.concepts).not.toContain('txt')
+    // A real technology still registers, and so does a code extension.
+    expect(facts.concepts).toContain('git')
+    expect(facts.concepts).toContain('ts')
+    // Diagnostic verbs are noise too: a container run listed `ps` as a
+    // 关键技术概念 after the session ran `ps aux` once.
+    const probe = extractFacts([
+      assistant('看看', [{ id: 'c1', name: 'bash', args: { command: 'ps aux' } }]),
+    ])
+    expect(probe.concepts).not.toContain('ps')
+  })
+
   it('drops host-re-injected context and prior frames', () => {
     const facts = extractFacts([
       user('You are an AI agent powered by DeepSeek Harness.', { kind: 'agent-instructions', form: 'instructions' }),
@@ -164,8 +227,42 @@ describe('composeDigest', () => {
     expect(second.text).toBe(first.text)
   })
 
+  it('does not render the last user request twice', () => {
+    // 主要意图 already ends with the last user request, so repeating it as the
+    // head of 当前进展 made the longest line of a real 478-token digest appear
+    // twice — and that duplicate was what pushed the page over its tier floor.
+    const messages = [user('把部署脚本修好，这是本次唯一的请求'), assistant('已经改完并提交')]
+    const result = composeDigest(extractFacts(messages), meta({ regionTokens: 100_000 }), { maxTokens: 800 })
+    expect(result.body.split('把部署脚本修好').length - 1).toBe(1)
+    // 当前进展 still says where things stood.
+    expect(result.body).toContain('已经改完并提交')
+  })
+
+  it('renders the immediate next action once, not also inside the todo list', () => {
+    const messages = [
+      user('继续'),
+      assistant('记录待办', [{ id: 'c1', name: 'todo_write', args: { todos: [
+        { content: '先修 A', status: 'pending' },
+        { content: '再修 B', status: 'pending' },
+      ] } }]),
+    ]
+    const result = composeDigest(extractFacts(messages), meta({ regionTokens: 100_000 }), { maxTokens: 800 })
+    expect(result.body).toContain(`## ${DIGEST_SECTIONS.next}\n- 先修 A`)
+    expect(result.body).toContain(`## ${DIGEST_SECTIONS.todos}\n- 再修 B`)
+    // The head of the list is shown as the next action and nowhere else.
+    expect(result.body.split('先修 A').length - 1).toBe(1)
+  })
+
   it('tightens the tier as the budget shrinks and never exceeds the hard cap', () => {
+    // The fixture has to be big enough that the *full* tier alone exceeds the
+    // 260-token floor, otherwise no budget can force a downgrade and the test
+    // asserts nothing. It previously crossed that line only because of a bug:
+    // 当前进展 repeated the last user request, which 主要意图 had already
+    // rendered — so the duplicated line was what pushed the page over the floor.
     const messages: Message[] = [user('长任务：' + '内容 '.repeat(400))]
+    for (let index = 0; index < 8; index += 1) {
+      messages.push(user(`第 ${index} 项请求：` + '这一段是足够长的用户原文，用来占满意图条的裁剪上限。'.repeat(6)))
+    }
     for (let index = 0; index < 40; index += 1) {
       messages.push(assistant(`第 ${index} 步说明文字`, [
         { id: `c${index}`, name: 'read', args: { file_path: `/w/file-${index}.ts` } },

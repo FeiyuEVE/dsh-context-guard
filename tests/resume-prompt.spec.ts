@@ -102,10 +102,31 @@ describe('archiveClause', () => {
   it('states that the document exists and where, without demanding a read', () => {
     expect(archiveClause(facts({ epoch: 4 }))).toBe([
       '本次压缩的交接文档（上一段上下文的归档）：',
-      '- 精简接力摘要（建议先读）：`/w/.handoff/sessions/a1/epoch-1.digest.md`',
-      '- 完整原文归档（需要细节时再读）：`/w/.handoff/sessions/a1/epoch-1.raw.md`',
-      '不要求通读，但请知道它在那里，需要时可直接 read。',
+      '- 接力摘要（先读这份）：`/w/.handoff/sessions/a1/epoch-1.digest.md`',
+      '- 完整原文归档（按需检索用，**不要整份读入**）：`/w/.handoff/sessions/a1/epoch-1.raw.md`',
+      '原文归档是那段历史的完整记录，体量与被压缩掉的上下文相当 ——'
+        + ' 整份读进来会把刚腾出的空间又填回去。需要细节时请先 grep 定位，再局部 read 那几段。',
     ].join('\n'))
+  })
+
+  it('sizes both documents so the reader can judge before opening them', () => {
+    // The raw archive is the complete record: measured at 286 KB / ~64k tokens
+    // for a 401-message region, i.e. about 59% of what the compaction replaced.
+    // Offering it without a size reads as "go and read this", which would refill
+    // the context the compaction just cleared.
+    const clause = archiveClause(facts({ rawBytes: 285_971, digestTokens: 478 }))
+    expect(clause).toContain('约 478 tokens')
+    expect(clause).toContain('279 KB')
+    expect(clause).toContain('72k tokens')
+    expect(clause).toContain('不要整份读入')
+    expect(clause).toContain('grep')
+  })
+
+  it('does not repeat the size when the caller did not measure it', () => {
+    const clause = archiveClause(facts())
+    expect(clause).toContain('不要整份读入')
+    expect(clause).not.toContain('KB')
+    expect(clause).not.toContain('tokens')
   })
 
   it('names only the digest when that is all the backend wrote', () => {
@@ -113,6 +134,8 @@ describe('archiveClause', () => {
     expect(clause).toContain('epoch-1.digest.md')
     expect(clause).not.toContain('完整原文归档')
     expect(clause).toContain('不要求通读')
+    // With no raw archive there is nothing to warn about reading whole.
+    expect(clause).not.toContain('grep')
   })
 
   it('says plainly that nothing was archived instead of claiming otherwise', () => {

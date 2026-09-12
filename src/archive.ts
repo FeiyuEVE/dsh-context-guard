@@ -57,6 +57,15 @@ export interface Artifacts {
   epoch?: number | undefined
   /** Absolute raw archive path, when it landed. */
   rawPath?: string | undefined
+  /**
+   * Size of the raw archive in bytes.
+   *
+   * The raw file is the complete record, so it is large by design (a real
+   * 401-message region produced 286 KB ≈ 64k tokens). The resume prompt states
+   * that size so the agent treats the file as something to search rather than
+   * something to read end to end.
+   */
+  rawBytes?: number | undefined
   /** Absolute digest path, when it landed. */
   digestPath?: string | undefined
   /** Estimated tokens of the digest. */
@@ -214,6 +223,7 @@ function writeRaw(
   writeAtomic(path.join(location.dir, LATEST_POINTER), `${file}\n`)
   artifacts.epoch = epoch
   artifacts.rawPath = file
+  artifacts.rawBytes = Buffer.byteLength(md, 'utf8')
   logInfo(log, logScope, 'raw-written', {
     epoch,
     session: location.session.length > 0 ? location.session : '(flat)',
