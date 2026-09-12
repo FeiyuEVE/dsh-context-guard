@@ -91,14 +91,14 @@ window.__ModuleLoader__.load({
     const css = [
       '/* dsh-context-guard: 上下文守卫设置分节 */',
       '.cg-root{display:flex;flex-direction:column;gap:16px;padding:4px 2px 24px;font-size:13px;color:var(--dsw-alias-label-primary)}',
-      '.cg-hint{font-size:12px;line-height:20px;color:var(--dsw-alias-label-tertiary)}',
-      '.cg-field{display:flex;flex-direction:column;gap:6px}',
+      '.cg-hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
+      '.cg-field{display:flex;flex-direction:column;gap:6px;min-width:0}',
       '.cg-label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.cg-input{box-sizing:border-box;width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:13px}',
       '.cg-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}',
       '.cg-select{box-sizing:border-box;width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:13px}',
       '.cg-select:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}',
-      '.cg-row{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:center}',
+      '.cg-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:center}',
       '.cg-row+.cg-row{margin-top:8px}',
       '.cg-btn{padding:5px 12px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px;cursor:pointer}',
       '.cg-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
@@ -109,12 +109,22 @@ window.__ModuleLoader__.load({
       '.cg-empty{font-size:12px;color:var(--dsw-alias-label-tertiary)}',
       '.cg-group{display:flex;flex-direction:column;gap:12px;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px}',
       '.cg-group-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
-      '.cg-check{display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer}',
+      '.cg-check{display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer;min-width:0}',
+      '.cg-check>span{flex:1 1 auto;min-width:0}',
       '.cg-check input{margin-top:2px}',
       '.cg-textarea{box-sizing:border-box;width:100%;min-height:88px;padding:8px 10px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;font-family:inherit;resize:vertical}',
       '.cg-textarea:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}',
       '.cg-row-inline{display:flex;gap:8px;align-items:center;justify-content:space-between}',
-      '.cg-grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}',
+      // 成对字段用 flex-wrap + flex-basis，而不是写死两列：容器够宽时自动两列，
+      // 容器变窄（手机 WebView 内容区约 380px，或被宿主壳挤到更窄）时自动落成一列。
+      // 这是内禀布局，不依赖视口宽度，所以在「宽视口 + 窄内容区」的壳里同样成立。
+      '.cg-grid2{display:flex;flex-wrap:wrap;gap:12px}',
+      '.cg-grid2>*{flex:1 1 200px;min-width:0}',
+      // 窄屏（手机 WebView 的 CSS 视口约 380–430px）一律单列：两列时每格只剩 ~180px，
+      // 标签折成两三行、下拉被截断、说明文字变成窄条。这里按视口宽度收口（宽屏设置
+      // 弹窗视口仍 ≥1000px，两列观感不变），比按容器宽度判断更可预期。
+      '@media (max-width:640px){.cg-grid2{grid-template-columns:minmax(0,1fr)}}',
+      '@media (max-width:640px){.cg-row{grid-template-columns:minmax(0,1fr)}.cg-row>*{width:100%}}',
     ].join('\n')
 
     /**
