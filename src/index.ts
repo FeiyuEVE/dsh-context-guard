@@ -25,7 +25,10 @@
  *    checkpoint. The backend stays in charge of the checkpoint the model sees;
  *    this is a side-car, and it is why the archive works with zero preset
  *    edits. Compactions this plugin's own engine ran are skipped — it wrote
- *    them itself, before the region was shadowed.
+ *    them itself, before the region was shadowed. The write is synchronous, so
+ *    the pair is already on disk when the backend appends the message that
+ *    replaces the region: the moment a compaction takes effect, its handoff
+ *    document exists.
  *
  * The continuation prompt is not a fixed string: it is rendered from measured
  * facts (how often this session compacted inside a sliding window, the digest
@@ -487,11 +490,11 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   /**
    * What the guard's own side-car writer produced for one compaction, keyed by
-   * `compactionId` inside one session. The value is the *in-flight* promise,
-   * so the continuation prompt can wait for it: the write is fire-and-forget
-   * from `compaction/summary`, while the continuation is rendered one
-   * `compaction/end` later — from a microtask that routinely wins the race
-   * against the first filesystem call.
+   * `compactionId` inside one session.
+   *
+   * The write is synchronous (see `archive.ts`), so by the time this record is
+   * written the files are already on disk — no in-flight state to await, and no
+   * way for the continuation prompt to name a file that is still being written.
    *
    * The continuation prompt must name files that exist, and a
    * `compaction-basic` checkpoint is a model-written summary that carries no
@@ -501,16 +504,16 @@ export function apply(ctx: Context, config: Config = {}): void {
    * first; the frame scan remains for compactions this guard did not archive
    * (an `ArchiveCutEngine` preset, whose frame does carry the paths).
    */
-  const archiveRecords = new WeakMap<Session, Map<string, Promise<Artifacts>>>()
+  const archiveRecords = new WeakMap<Session, Map<string, Artifacts>>()
 
-  /** Remember one compaction's pending or landed artifacts, keeping the newest few. */
-  function recordArchive(session: Session, compactionId: string, work: Promise<Artifacts>): void {
+  /** Remember one compaction's artifacts, keeping the newest few. */
+  function recordArchive(session: Session, compactionId: string, artifacts: Artifacts): void {
     let records = archiveRecords.get(session)
     if (records === undefined) {
       records = new Map()
       archiveRecords.set(session, records)
     }
-    records.set(compactionId, work)
+    records.set(compactionId, artifacts)
     while (records.size > ARCHIVE_RECORD_LIMIT) {
       const oldest = records.keys().next()
       if (oldest.done === true) break
@@ -523,24 +526,27 @@ export function apply(ctx: Context, config: Config = {}): void {
    *
    * This is the "side-car" half of the plugin: whatever engine the preset
    * mounted stays in charge of the checkpoint the model sees, and the guard
-   * only adds the deterministic `raw` + `digest` pair beside it. Everything
-   * here is fire-and-forget — `session/event` is a plain cordis `emit`, whose
-   * listeners are not awaited, and the backend appends the region's
-   * replacement immediately after this event. The region's events are read
-   * from the append-only log, so they are still there when this runs; the
-   * files, however, may land after the surface has already moved on (see
-   * `docs/gotchas.md`).
+   * only adds the deterministic `raw` + `digest` pair beside it.
+   *
+   * It runs **synchronously**, inside the dispatch of `compaction/summary`.
+   * That is the whole point: dsh invokes `session/event` listeners synchronously
+   * but never awaits them, and the backend appends the region's replacement
+   * message right after this event with no `await` in between — so an
+   * asynchronous write would still be in flight while the region leaves the
+   * model's view. Writing here means that the moment the compaction takes
+   * effect, the handoff document already exists (see `archive.ts` for the
+   * trade-off this buys).
    *
    * @param session - session whose compaction committed the summary.
    * @param compactionId - id of that compaction, the key of the archive record.
    * @param shadowedSeqs - the shadowed surface nodes, captured synchronously.
-   * @returns what landed; never rejects.
+   * @returns what landed; never throws.
    */
-  async function writeSidecar(
+  function writeSidecar(
     session: Session,
     compactionId: string,
     shadowedSeqs: readonly SessionSeq[],
-  ): Promise<Artifacts> {
+  ): Artifacts {
     try {
       const base = sessionBase(session)
       if (base === undefined) {
@@ -561,7 +567,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       // among the session's compactions. `compaction/end` has not been
       // appended yet, so the pace still counts the compactions before this one.
       const epoch = compactionPace(session, Date.now(), resolved.resumeWindowMinutes).sessionTotal + 1
-      const artifacts = await writeArchive({
+      const artifacts = writeArchive({
         base,
         layout: resolved.archiveLayout,
         epochPrefix: EPOCH_PREFIX,
@@ -607,11 +613,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       // Only other backends need the side-car.
       if (event.data.provider !== 'context-guard') {
         const compactionId = String(event.data.compactionId)
-        recordArchive(
-          session,
-          compactionId,
-          writeSidecar(session, compactionId, [...event.data.shadowedSeqs]),
-        )
+        // Synchronous by contract: the pair is on disk before this append
+        // returns, hence before the backend appends the replacing message.
+        recordArchive(session, compactionId, writeSidecar(session, compactionId, [...event.data.shadowedSeqs]))
       }
       return
     }
@@ -642,15 +646,15 @@ export function apply(ctx: Context, config: Config = {}): void {
       const frame = checkpointText(agent.session, compactionId)
       // Two sources, in trust order:
       // 1. the guard's own record of the side-car it wrote for this exact
-      //    compaction — exact, and the only source for a backend whose
-      //    checkpoint is a model-written summary;
+      //    compaction — exact, written synchronously while the region was still
+      //    on the surface, and the only source for a backend whose checkpoint
+      //    is a model-written summary;
       // 2. the deterministic pointer frame an `ArchiveCutEngine` returns,
       //    which describes real archives only when it carries the marker
       //    (a foreign summary's paths are prose).
       // Every pointer is then re-checked against the filesystem, so the
       // prompt never names a file that is not there.
-      const pending = archiveRecords.get(agent.session)?.get(compactionId)
-      const recorded = pending === undefined ? undefined : await pending
+      const recorded = archiveRecords.get(agent.session)?.get(compactionId)
       const ownsFrame = frame.includes(FRAME_MARKER)
       const digestPath = await existingFile(
         recorded?.digestPath ?? (ownsFrame ? await digestPathFor(agent, frame) : undefined),

@@ -91,8 +91,9 @@ describe('decideResume', () => {
 
   it('names the digest placeholder even when the backend wrote none', () => {
     const decision = decideResume(DEFAULT_RESUME_PROMPT, facts({ digestPath: undefined, rawPath: undefined }), { escalation: true })
-    expect(decision.prompt).toContain('（本次未生成摘要文件）')
-    expect(decision.prompt).toContain('（本次未生成归档文件）')
+    // The handoff clause states plainly that nothing was archived, instead of
+    // claiming the history was archived and then naming a missing file.
+    expect(decision.prompt).toContain('本次压缩没有生成归档文档')
   })
 })
 

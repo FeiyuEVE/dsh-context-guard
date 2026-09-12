@@ -221,7 +221,9 @@ export class ArchiveCutEngine extends BasicCompactionEngine {
       (total, message) => total + estimateMessageTokens(message, resolved.estimator),
       0,
     )
-    const artifacts = await writeArchive({
+    // Synchronous on purpose: the files must exist before this summarizer's
+    // result is framed and committed (see `archive.ts`).
+    const artifacts = writeArchive({
       base: this.resolveBaseDir(agent),
       layout: resolved.layout,
       epochPrefix: this.epochPrefix,

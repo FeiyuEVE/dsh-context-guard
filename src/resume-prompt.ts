@@ -25,12 +25,21 @@ export const DEFAULT_WRAP_UP_PROMPT =
   + '3) 在回复末尾输出一段 ≤200 字、自包含的接力总结（截断后它将是上下文里唯一的对话帧）；\n'
   + '4) 不要启动新的子任务或继续深入探索，完成后停止。'
 
-/** Default continuation prompt: pick the task back up from the digested state. */
+/**
+ * Default continuation prompt: pick the task back up from the digested state.
+ *
+ * `{{archive}}` renders the handoff-document clause — written to state plainly
+ * that the document exists and where it is, and to say so only when it really
+ * does (see {@link archiveClause}). It never asks the agent to verify the file:
+ * the guard checked the filesystem before rendering, and an existence check by
+ * the model would be a wasted step. `{{digest}}`/`{{raw}}` stay available for
+ * hand-written templates.
+ */
 export const DEFAULT_RESUME_PROMPT =
-  '上下文已压缩（历史已确定性归档）。精简接力摘要（优先读）：`{{digest}}`；'
-  + '完整原始记录（需要细节时）：`{{raw}}`。\n'
-  + '需要细节时用 read 按需读取，不要在上下文中复述已归档内容；'
-  + '然后继续执行压缩前正在进行的任务，直到任务完成。'
+  '上下文已压缩。\n'
+  + '{{archive}}\n'
+  + '然后继续执行压缩前正在进行的任务，直到任务完成；'
+  + '需要更多细节时再按需 read，不必在上下文中复述整份归档。'
 
 /** Escalation level of one resume decision. */
 export type ResumeLevel = 'L0' | 'L1' | 'L2' | 'L3'
@@ -95,6 +104,33 @@ function toolList(tools: readonly string[]): string {
   return tools.map(tool => `\`${tool}\``).join(' / ')
 }
 
+/**
+ * The handoff-document clause: what this compaction archived, or that it
+ * archived nothing.
+ *
+ * Only the caller that really checked the filesystem may pass these paths, so
+ * this clause can state the document's existence as a fact — and when there is
+ * nothing to name it says exactly that, instead of an unconditional claim that
+ * the history was archived.
+ *
+ * @param facts - measured facts; `digestPath`/`rawPath` are confirmed to exist.
+ */
+export function archiveClause(facts: ResumeFacts): string {
+  const { digestPath, rawPath } = facts
+  if (digestPath === undefined && rawPath === undefined) {
+    return '本次压缩没有生成归档文档；上面那段摘要就是本次压缩的全部交接内容。'
+  }
+  const lines = ['本次压缩的交接文档（上一段上下文的归档）：']
+  if (digestPath !== undefined) {
+    lines.push(`- 精简接力摘要（建议先读）：\`${digestPath}\``)
+  }
+  if (rawPath !== undefined) {
+    lines.push(`- 完整原文归档（需要细节时再读）：\`${rawPath}\``)
+  }
+  lines.push('不要求通读，但请知道它在那里，需要时可直接 read。')
+  return lines.join('\n')
+}
+
 /** One-line account of the pending todos, for prompt tails. */
 function todoBlock(todos: readonly string[]): string {
   if (todos.length === 0) return ''
@@ -141,8 +177,9 @@ export function decideResume(template: string, facts: ResumeFacts, policy: Resum
       level: 'L3',
       suppress: true,
       prompt: `本会话在 ${facts.windowMinutes} 分钟内已自动压缩 ${facts.compactionsInWindow} 次；`
-        + '为避免压缩—续跑空转，本次不再自动续跑。归档与摘要已落盘，'
-        + '请查看后由用户决定如何继续（直接发消息继续，或把任务拆小）。',
+        + '为避免压缩—续跑空转，本次不再自动续跑。'
+        + `${archiveClause(facts)}\n`
+        + '请由用户决定如何继续（直接发消息继续，或把任务拆小）。',
     }
   }
   const level: ResumeLevel = !policy.escalation || facts.compactionsInWindow <= 1
@@ -152,6 +189,7 @@ export function decideResume(template: string, facts: ResumeFacts, policy: Resum
     epoch: String(facts.epoch),
     window: String(facts.windowMinutes),
     compactions: String(facts.compactionsInWindow),
+    archive: archiveClause(facts),
     digest: facts.digestPath ?? '（本次未生成摘要文件）',
     raw: facts.rawPath ?? '（本次未生成归档文件）',
     intent: facts.intent ?? '',

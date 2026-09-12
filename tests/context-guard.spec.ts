@@ -643,8 +643,7 @@ describe('resume archive pointers', () => {
     ].join('\n')
 
     const text = await cutOnceAndResume(compaction!, agent, adapter)
-    expect(text).toContain('（本次未生成摘要文件）')
-    expect(text).toContain('（本次未生成归档文件）')
+    expect(text).toContain('本次压缩没有生成归档文档')
     expect(text).not.toContain('epoch-N.digest.md')
     expect(text).not.toContain('epoch-299.raw.md')
     void ctx
@@ -675,7 +674,7 @@ describe('resume archive pointers', () => {
     const text = await cutOnceAndResume(compaction!, agent, adapter)
     expect(text).toContain(digest)
     expect(text).toContain(raw)
-    expect(text).not.toContain('（本次未生成摘要文件）')
+    expect(text).not.toContain('本次压缩没有生成归档文档')
     void ctx
   })
 
@@ -695,7 +694,7 @@ describe('resume archive pointers', () => {
     ].join('\n')
 
     const text = await cutOnceAndResume(compaction!, agent, adapter)
-    expect(text).toContain('（本次未生成摘要文件）')
+    expect(text).toContain('本次压缩没有生成归档文档')
     expect(text).not.toContain('/nonexistent-cg/epoch-7.digest.md')
     void ctx
   })
@@ -781,8 +780,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain(path.join(sessionDir, 'epoch-1.digest.md'))
     expect(messages[0]!.text).toContain(path.join(sessionDir, 'epoch-1.raw.md'))
-    expect(messages[0]!.text).not.toContain('（本次未生成摘要文件）')
-    expect(messages[0]!.text).not.toContain('（本次未生成归档文件）')
+    expect(messages[0]!.text).not.toContain('本次压缩没有生成归档文档')
     void ctx
   })
 
@@ -862,7 +860,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     // withholds, because a frame that claims a file that does not exist must
     // not send the resumed agent there.
     const messages = guardMessages(agent)
-    expect(messages[0]!.text).toContain('（本次未生成摘要文件）')
+    expect(messages[0]!.text).toContain('本次压缩没有生成归档文档')
     void ctx
   })
 })

@@ -12,13 +12,25 @@
  * without dragging `@deepseek-ai/dsh-compaction-basic`'s runtime class into a
  * composition that only mounts the guard row.
  *
+ * The writer is deliberately **synchronous**. `compaction/summary` reaches
+ * listeners through `session/event`, which dsh invokes synchronously but never
+ * awaits (`@mode emit`), and the backend appends the region's replacement
+ * message immediately after with no `await` in between. An asynchronous write
+ * would therefore keep running while the region leaves the model's view. Writing
+ * synchronously inside that listener is the only way to guarantee the archive is
+ * already on disk when the compaction takes effect — and "when the compaction is
+ * done, the handoff document already exists" is the property that matters. The
+ * price is that the caller waits for the write (a few milliseconds for a normal
+ * region); a hung archive filesystem would stall that caller instead of merely
+ * losing the archive.
+ *
  * Every failure degrades rather than throws: a compaction must never fail
  * because an archive could not be written.
  *
  * @module dsh-context-guard/archive
  */
 
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
+import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import {
@@ -95,10 +107,10 @@ export interface ArchiveRequest {
 }
 
 /** Write one file atomically (tmp + rename) so readers never see a partial document. */
-async function writeAtomic(file: string, text: string): Promise<void> {
+function writeAtomic(file: string, text: string): void {
   const tmp = `${file}.tmp-${process.pid}`
-  await writeFile(tmp, text, 'utf8')
-  await rename(tmp, file)
+  writeFileSync(tmp, text, 'utf8')
+  renameSync(tmp, file)
 }
 
 /** Escape a filename prefix for the epoch-scanning regex. */
@@ -115,11 +127,11 @@ function messageText(message: Message): string {
 }
 
 /** Next unused epoch in one directory: one past the highest raw archive present. */
-async function nextEpoch(dir: string, epochPrefix: string): Promise<number> {
+function nextEpoch(dir: string, epochPrefix: string): number {
   let max = 0
   const pattern = new RegExp(`^${escapeRegExp(epochPrefix)}-(\\d+)\\.raw\\.md$`)
   try {
-    for (const name of await readdir(dir)) {
+    for (const name of readdirSync(dir)) {
       const match = pattern.exec(name)
       if (match !== null) max = Math.max(max, Number(match[1]))
     }
@@ -137,7 +149,7 @@ async function nextEpoch(dir: string, epochPrefix: string): Promise<number> {
  * @param request - the region, the destination, and the digest knobs.
  * @returns what landed; empty when the base directory was unresolvable.
  */
-export async function writeArchive(request: ArchiveRequest): Promise<Artifacts> {
+export function writeArchive(request: ArchiveRequest): Artifacts {
   const {
     base,
     layout,
@@ -157,13 +169,13 @@ export async function writeArchive(request: ArchiveRequest): Promise<Artifacts> 
   const location = archiveLocation(base, sessionId, layout)
   const artifacts: Artifacts = { regionTokens }
   try {
-    await mkdir(location.dir, { recursive: true })
-    await writeRaw(location, messages, config, artifacts, log, logScope, epochPrefix, minEpoch)
+    mkdirSync(location.dir, { recursive: true })
+    writeRaw(location, messages, config, artifacts, log, logScope, epochPrefix, minEpoch)
     if (!config.enabled) {
       logInfo(log, logScope, 'skipped', { reason: 'disabled', session: sessionId })
       return artifacts
     }
-    await writeDigest(location, sessionId, messages, config, artifacts, log, logScope, epochPrefix)
+    writeDigest(location, sessionId, messages, config, artifacts, log, logScope, epochPrefix)
   } catch (error: unknown) {
     logWarn(log, logScope, 'write-failed', {
       session: sessionId,
@@ -175,7 +187,7 @@ export async function writeArchive(request: ArchiveRequest): Promise<Artifacts> 
 }
 
 /** Write the lossless archive and move its pointer. */
-async function writeRaw(
+function writeRaw(
   location: ArchiveLocation,
   messages: readonly Message[],
   config: ResolvedDigestConfig,
@@ -184,13 +196,13 @@ async function writeRaw(
   logScope: string,
   epochPrefix: string,
   minEpoch: number | undefined,
-): Promise<void> {
-  const scanned = await nextEpoch(location.dir, epochPrefix)
+): void {
+  const scanned = nextEpoch(location.dir, epochPrefix)
   const epoch = minEpoch === undefined ? scanned : Math.max(scanned, minEpoch)
   const file = path.join(location.dir, `${epochPrefix}-${epoch}.raw.md`)
   const md = messagesToMarkdown(messages, { excludeInjected: config.rawExcludeInjected })
-  await writeAtomic(file, md)
-  await writeAtomic(path.join(location.dir, LATEST_POINTER), `${file}\n`)
+  writeAtomic(file, md)
+  writeAtomic(path.join(location.dir, LATEST_POINTER), `${file}\n`)
   artifacts.epoch = epoch
   artifacts.rawPath = file
   logInfo(log, logScope, 'raw-written', {
@@ -204,7 +216,7 @@ async function writeRaw(
 }
 
 /** Write the deterministic digest and move its pointer. */
-async function writeDigest(
+function writeDigest(
   location: ArchiveLocation,
   sessionId: string,
   messages: readonly Message[],
@@ -213,7 +225,7 @@ async function writeDigest(
   log: LogSink,
   logScope: string,
   epochPrefix: string,
-): Promise<void> {
+): void {
   const epoch = artifacts.epoch ?? 1
   const estimator = config.estimator
   const regionTokens = artifacts.regionTokens ?? messages.reduce(
@@ -221,7 +233,7 @@ async function writeDigest(
     0,
   )
   const carried = config.carryForward
-    ? await readCarried(location, sessionId, messages, log, logScope)
+    ? readCarried(location, sessionId, messages, log, logScope)
     : undefined
   const facts = extractFacts(messages)
   const result = composeDigest(facts, {
@@ -240,8 +252,8 @@ async function writeDigest(
   })
 
   const file = path.join(location.dir, `${epochPrefix}-${epoch}.digest.md`)
-  await writeAtomic(file, result.text)
-  await writeAtomic(path.join(location.dir, LATEST_DIGEST_POINTER), `${file}\n`)
+  writeAtomic(file, result.text)
+  writeAtomic(path.join(location.dir, LATEST_DIGEST_POINTER), `${file}\n`)
 
   artifacts.digestPath = file
   artifacts.digestTokens = result.digestTokens
@@ -271,16 +283,16 @@ async function writeDigest(
  * for a referenced digest path — the previous frame carries it. A digest
  * belonging to a different session is never inherited.
  */
-async function readCarried(
+function readCarried(
   location: ArchiveLocation,
   sessionId: string,
   messages: readonly Message[],
   log: LogSink,
   logScope: string,
-): Promise<{ sections: Map<string, string[]>; from?: number } | undefined> {
+): { sections: Map<string, string[]>; from?: number } | undefined {
   const candidates: string[] = []
   try {
-    const pointer = (await readFile(path.join(location.dir, LATEST_DIGEST_POINTER), 'utf8')).trim()
+    const pointer = readFileSync(path.join(location.dir, LATEST_DIGEST_POINTER), 'utf8').trim()
     if (pointer.length > 0) candidates.push(pointer)
   } catch {
     // No pointer yet: fall through to the in-region reference.
@@ -291,7 +303,7 @@ async function readCarried(
   }
   for (const candidate of candidates) {
     try {
-      const text = await readFile(candidate, 'utf8')
+      const text = readFileSync(candidate, 'utf8')
       const owner = /^- 会话: (.+)$/m.exec(text)?.[1]?.trim()
       if (owner !== undefined && owner !== sessionId) {
         logWarn(log, logScope, 'carry-forward-skipped', {
