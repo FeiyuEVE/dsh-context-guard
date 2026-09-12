@@ -18,6 +18,7 @@
  */
 
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import { isInjectedContext } from './digest.ts'
 
 /** Length knobs for the cleaner. */
 export interface CleanOptions {
@@ -27,6 +28,13 @@ export interface CleanOptions {
   resultPreviewChars?: number
   /** Keep reasoning blocks inside a collapsed `<details>` element. */
   includeReasoning?: boolean
+  /**
+   * Drop host-re-injected context (system prompt, AGENTS.md instructions, skill
+   * catalogs, plugin snapshots, prior compaction frames). Off by default: the
+   * raw archive is the lossless record, and only a caller who prefers a smaller
+   * readable document turns this on.
+   */
+  excludeInjected?: boolean
 }
 
 const DEFAULT_TOOL_ARG_CHARS = 500
@@ -120,8 +128,10 @@ export function messagesToMarkdown(messages: readonly Message[], options: CleanO
     toolArgChars: options.toolArgChars ?? DEFAULT_TOOL_ARG_CHARS,
     resultPreviewChars: options.resultPreviewChars ?? DEFAULT_RESULT_PREVIEW_CHARS,
     includeReasoning: options.includeReasoning ?? false,
+    excludeInjected: options.excludeInjected ?? false,
   }
   const sections = messages
+    .filter(message => !resolved.excludeInjected || !isInjectedContext(message))
     .map(message => renderMessage(message, resolved))
     .filter(section => section.length > 0)
   if (sections.length === 0) return '# 会话归档（空）\n'

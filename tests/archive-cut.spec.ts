@@ -139,6 +139,7 @@ async function bootLoop(
   engineConfig: Record<string, unknown> = {},
   taskText = TASK_TEXT,
   contextWindow = 300,
+  sessionId = 'a1',
 ): Promise<{ ctx: Context; agent: Awaited<ReturnType<AgentLoop['create']>>; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
@@ -161,9 +162,14 @@ async function bootLoop(
   }))
   const adapter = new MockAdapter(script, contextWindow)
   ctx.llm.registerAdapter(['mock'], adapter)
-  const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+  const agent = await ctx.agentLoop.create(SessionId(sessionId), { provider: 'mock', model: 'mock' })
   agent.followup(createUserMessage({ content: [{ type: 'text', text: taskText }], source: { kind: 'user' } }))
   return { ctx, agent, adapter }
+}
+
+/** The session-scoped archive directory the default layout resolves to. */
+function sessionArchiveDir(archiveDir: string, sessionId = 'a1'): string {
+  return path.join(archiveDir, 'sessions', sessionId)
 }
 
 function guardMessages(agent: { session: { snapshotEvents(): readonly SessionEvent[] } }): string[] {
@@ -209,7 +215,8 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
     expect(messages[0]).toContain('接力总结')
     expect(messages[1]).toContain('继续')
 
-    // The checkpoint frame the model sees points at the deterministic archive.
+    // The checkpoint frame the model sees points at the deterministic archive
+    // and at the digest.
     const checkpointText = [...agent.session.snapshotEvents()]
       .filter((e): e is SessionEvent<'user/message'> => e.type === 'user/message')
       .flatMap(e => e.data.content.filter(b => b.type === 'text').map(b => b.text))
@@ -217,16 +224,29 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
     expect(checkpointText).toBeDefined()
     expect(checkpointText).toContain('未调用模型摘要请求')
     expect(checkpointText).toContain('epoch-1.raw.md')
+    expect(checkpointText).toContain('epoch-1.digest.md')
     expect(checkpointText).toContain(archiveDir)
 
     // The archive file exists and holds the archived region verbatim.
-    const archivePath = path.join(archiveDir, 'epoch-1.raw.md')
+    const sessionDir = sessionArchiveDir(archiveDir)
+    const archivePath = path.join(sessionDir, 'epoch-1.raw.md')
     const md = await readFile(archivePath, 'utf8')
     expect(md).toContain('## 用户')
     expect(md).toContain('start start')
     expect(md).toContain('🔧 probe')
-    const latest = await readFile(path.join(archiveDir, 'latest.txt'), 'utf8')
+    const latest = await readFile(path.join(sessionDir, 'latest.txt'), 'utf8')
     expect(latest.trim()).toBe(archivePath)
+
+    // The digest landed beside it, carries the format marker and the facts,
+    // and its pointer names it.
+    const digestPath = path.join(sessionDir, 'epoch-1.digest.md')
+    const digest = await readFile(digestPath, 'utf8')
+    expect(digest).toContain('<!-- context-guard-digest v1 -->')
+    expect(digest).toContain('- 会话: a1')
+    expect(digest).toContain('## 主要意图')
+    expect(digest).toContain('start start')
+    expect(digest).toContain('未调用模型摘要')
+    expect((await readFile(path.join(sessionDir, 'latest-digest.txt'), 'utf8')).trim()).toBe(digestPath)
 
     await vi.waitFor(() => { expect(agent.status).toBe('idle') })
     void ctx
@@ -279,9 +299,63 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
       expect(adapter.requests).toHaveLength(4)
       expect(agent.status).toBe('idle')
     })
-    expect((await readdir(archiveDir)).sort()).toEqual(['epoch-1.raw.md', 'epoch-2.raw.md', 'latest.txt'])
-    const latest = await readFile(path.join(archiveDir, 'latest.txt'), 'utf8')
-    expect(latest.trim()).toBe(path.join(archiveDir, 'epoch-2.raw.md'))
+    const sessionDir = sessionArchiveDir(archiveDir)
+    expect((await readdir(sessionDir)).sort()).toEqual([
+      'epoch-1.digest.md',
+      'epoch-1.raw.md',
+      'epoch-2.digest.md',
+      'epoch-2.raw.md',
+      'latest-digest.txt',
+      'latest.txt',
+    ])
+    const latest = await readFile(path.join(sessionDir, 'latest.txt'), 'utf8')
+    expect(latest.trim()).toBe(path.join(sessionDir, 'epoch-2.raw.md'))
+    expect((await readFile(path.join(sessionDir, 'latest-digest.txt'), 'utf8')).trim())
+      .toBe(path.join(sessionDir, 'epoch-2.digest.md'))
+
+    // Carry-forward: the second digest inherits the first one's facts, so the
+    // session's older history survives the second cut.
+    const secondDigest = await readFile(path.join(sessionDir, 'epoch-2.digest.md'), 'utf8')
+    expect(secondDigest).toContain('- 继承: 第 1 次')
+    expect(secondDigest).toContain('- 第几次: 2')
+    void ctx
+  })
+
+  it('keeps two concurrent sessions of one workspace in separate directories', async () => {
+    const archiveDir = await makeTmpDir()
+    // Wide windows: the guard must never auto-trigger here, so both cuts are
+    // the manual ones this test drives.
+    const first = await bootLoop([textResponse('a'), textResponse('b')], archiveDir, { retainTokens: 10 }, 'mid '.repeat(180), 2000, 'a1')
+    const second = await bootLoop([textResponse('a'), textResponse('b')], archiveDir, { retainTokens: 10 }, 'mid '.repeat(180), 2000, 'b2')
+    await vi.waitFor(() => { expect(first.agent.status).toBe('idle') })
+    await vi.waitFor(() => { expect(second.agent.status).toBe('idle') })
+
+    expect(await first.ctx.get('compaction')?.compactNow(first.agent, new AbortController().signal)).not.toBeNull()
+    expect(await second.ctx.get('compaction')?.compactNow(second.agent, new AbortController().signal)).not.toBeNull()
+
+    // Same workspace base, different session directories: each session numbers
+    // its own epochs from 1 and neither archive can truncate the other.
+    const expected = ['epoch-1.digest.md', 'epoch-1.raw.md', 'latest-digest.txt', 'latest.txt']
+    expect((await readdir(sessionArchiveDir(archiveDir, 'a1'))).sort()).toEqual(expected)
+    expect((await readdir(sessionArchiveDir(archiveDir, 'b2'))).sort()).toEqual(expected)
+    expect(await readdir(archiveDir)).toEqual(['sessions'])
+    void first.ctx
+    void second.ctx
+  })
+
+  it('supports the legacy flat layout on request', async () => {
+    const archiveDir = await makeTmpDir()
+    const { ctx, agent } = await bootLoop(
+      [textResponse('a'), textResponse('b')],
+      archiveDir,
+      { retainTokens: 10, archiveLayout: 'flat' },
+      'mid '.repeat(180),
+      2000,
+    )
+    await vi.waitFor(() => { expect(agent.status).toBe('idle') })
+    expect(await ctx.get('compaction')?.compactNow(agent, new AbortController().signal)).not.toBeNull()
+    expect((await readdir(archiveDir)).sort())
+      .toEqual(['epoch-1.digest.md', 'epoch-1.raw.md', 'latest-digest.txt', 'latest.txt'])
     void ctx
   })
 })

@@ -25,41 +25,53 @@ import { StubCompactionEngine } from './stub-compaction.ts'
 /** Long initial task text: ~440 heuristic tokens, over a 255-token threshold. */
 const TASK_TEXT = 'start '.repeat(350)
 
-/** Minimal fake settings provider serving the `context-guard` namespace. */
+/**
+ * Minimal fake settings provider serving the `context-guard` namespace.
+ *
+ * `get()` returns `base` layered under the user section, because the real
+ * provider resolves the composition base into every read: a double returning
+ * only the user section would make template precedence behave differently from
+ * production (`withDefaults` would turn an absent template into the empty
+ * string, i.e. "disabled").
+ */
 type ThresholdSettingsValue = {
   defaultThresholdTokens: number
   providerThresholds: { provider: string; thresholdTokens: number }[]
 }
 interface FakeSettingsScope {
-  get(): ThresholdSettingsValue
-  watch(callback: (value: ThresholdSettingsValue) => void): () => void
+  get(): Record<string, unknown>
+  watch(callback: (value: Record<string, unknown>) => void): () => void
   update(patch: object): Promise<void>
 }
-function fakeSettings(initial: ThresholdSettingsValue): {
-  value: ThresholdSettingsValue
+function fakeSettings(initial: ThresholdSettingsValue & Record<string, unknown>): {
+  value: Record<string, unknown>
   scope: FakeSettingsScope | undefined
   provide(ctx: Context): void
 } {
-  const watchers = new Set<(value: ThresholdSettingsValue) => void>()
+  const watchers = new Set<(value: Record<string, unknown>) => void>()
+  let base: Record<string, unknown> = {}
   const state: {
-    value: ThresholdSettingsValue
+    value: Record<string, unknown>
     scope: FakeSettingsScope | undefined
     provide(ctx: Context): void
   } = {
     value: initial,
     scope: undefined,
     provide(ctx) {
+      /** Resolved view: composition base under the user section. */
+      const resolve = (): Record<string, unknown> => ({ ...base, ...state.value })
       ctx.provide('settings', {
-        register() {
+        register(_ns: string, _schema: unknown, options?: { base?: Record<string, unknown> }) {
+          base = options?.base ?? {}
           state.scope = {
-            get: () => state.value,
-            watch: (callback: (value: ThresholdSettingsValue) => void) => {
+            get: () => resolve(),
+            watch: (callback: (value: Record<string, unknown>) => void) => {
               watchers.add(callback)
               return () => { watchers.delete(callback) }
             },
             update: async (patch: object) => {
-              state.value = { ...state.value, ...patch } as ThresholdSettingsValue
-              for (const watcher of watchers) watcher(state.value)
+              state.value = { ...state.value, ...patch }
+              for (const watcher of watchers) watcher(resolve())
             },
           }
           return state.scope
@@ -354,6 +366,61 @@ describe('context-guard failure and configuration paths', () => {
   })
 })
 
+describe('resume escalation', () => {
+  it('escalates the continuation prompt after a second compaction in the window', async () => {
+    // Wide window so the guard never auto-triggers: both cuts are manual here,
+    // because what is under test is the guard's continuation, not the trigger.
+    const { ctx, agent, compaction, adapter } = await harness(
+      [
+        textResponse('first'),
+        textResponse('resumed once'),
+        textResponse('grown'),
+        textResponse('resumed twice'),
+      ],
+      {},
+      4000,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    expect(await compaction!.compactNow(agent, new AbortController().signal)).not.toBeNull()
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(2)
+      expect(agent.status).toBe('idle')
+    })
+
+    const afterFirst = guardMessages(agent)
+    expect(afterFirst).toHaveLength(1)
+    expect(afterFirst[0]!.text).toContain('继续执行')
+    expect(afterFirst[0]!.text).not.toContain('增量推进')
+
+    // Grow the surface with a non-human message, so the human anchor — and
+    // therefore the compaction count — is not reset by the growth turn.
+    agent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'grow '.repeat(200) }],
+      source: { kind: 'plugin', plugin: 'test' },
+    }))
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(3)
+      expect(agent.status).toBe('idle')
+    })
+    expect(await compaction!.compactNow(agent, new AbortController().signal)).not.toBeNull()
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(4)
+      expect(agent.status).toBe('idle')
+    })
+
+    const afterSecond = guardMessages(agent)
+    expect(afterSecond).toHaveLength(2)
+    expect(afterSecond[1]!.text).toContain('增量推进')
+    expect(afterSecond[1]!.text).toContain('已自动压缩 2 次')
+    // The deferred resume still lands, and the session settles.
+    expect(agent.status).toBe('idle')
+    void ctx
+  })
+})
+
 describe('settings-provided absolute thresholds', () => {
   it('uses the per-provider absolute token threshold: above it nothing fires, at it the loop runs', async () => {
     // Task pressure ≈ 560 tokens incl. the system prompt (ratio fallback 255).
@@ -438,6 +505,73 @@ describe('settings-provided absolute thresholds', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0]!.text).toContain('继续')
     expect(compaction!.compactNowCalls).toEqual([1])
+    void ctx
+  })
+})
+
+/*
+ * Template precedence. The composition value is baked into the settings base
+ * layer, so the resolved settings value is authoritative *including when it is
+ * the empty string*: clearing a template field in the Web panel is the only way
+ * a user can turn that injection off, and it must not silently fall back to the
+ * composition text. Found by browser verification on 2026-09-12.
+ */
+describe('template precedence over the settings layer', () => {
+  it('an empty settings wrap-up template disables the reminder but not compaction', async () => {
+    const settings = fakeSettings({
+      defaultThresholdTokens: 400,
+      providerThresholds: [],
+      wrapUpPromptTemplate: '',
+    })
+    const { ctx, agent, compaction } = await harness(
+      [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('wrapping up now'), textResponse('continuing')],
+      {},
+      300,
+      true,
+      settings,
+    )
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+    const messages = guardMessages(agent)
+    // The reminder would normally fire on the tool-call step; only the resume lands.
+    expect(messages.filter(m => m.text.includes('接近上限'))).toEqual([])
+    expect(messages.some(m => m.text.includes('继续'))).toBe(true)
+    expect(compaction!.compactNowCalls).toEqual([1])
+    void ctx
+  })
+
+  it('an empty settings resume template disables the post-compaction wake-up', async () => {
+    const settings = fakeSettings({
+      defaultThresholdTokens: 400,
+      providerThresholds: [],
+      resumePromptTemplate: '',
+    })
+    const { ctx, agent, compaction } = await harness(
+      [textResponse('first turn'), textResponse('unreachable')],
+      {},
+      300,
+      true,
+      settings,
+    )
+    // Compaction still runs on idle; only the continuation is withheld, so the
+    // turn count stays at one.
+    await vi.waitFor(() => { expect(compaction!.compactNowCalls).toEqual([1]) })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(guardMessages(agent)).toEqual([])
+    expect(turnsEnded(agent)).toBe(1)
+    void ctx
+  })
+
+  it('a composition-configured template still wins when settings has no override', async () => {
+    const settings = fakeSettings({ defaultThresholdTokens: 400, providerThresholds: [] })
+    const { ctx, agent } = await harness(
+      [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('config text'), textResponse('continuing')],
+      { wrapUpPrompt: '配置层收尾提醒' },
+      300,
+      true,
+      settings,
+    )
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+    expect(guardMessages(agent).some(m => m.text.includes('配置层收尾提醒'))).toBe(true)
     void ctx
   })
 })

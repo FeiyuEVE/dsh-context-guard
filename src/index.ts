@@ -6,10 +6,10 @@
  *
  * 1. `step/end` — after a step that still owes another model request, the
  *    session's request pressure is measured against the routed model's
- *    context window. Above {@link Config.thresholdRatio} the guard queues a
- *    wrap-up reminder that the next `agent/pre-step` folds into the entering
- *    messages, so the model sees it before its very next action and wraps the
- *    turn up instead of extending it.
+ *    context window. Above the threshold the guard queues a wrap-up reminder
+ *    that the next `agent/pre-step` folds into the entering messages, so the
+ *    model sees it before its very next action and wraps the turn up instead
+ *    of extending it.
  * 2. `agent/status` idle — when the agent stops and the session is still over
  *    the threshold, the guard runs `compaction.compactNow()` once per
  *    over-threshold episode. The engine is resolved per agent: a host-plane
@@ -20,6 +20,14 @@
  *    guard queues a continuation prompt and wakes the driver, so the task
  *    resumes on the compacted surface instead of sitting idle.
  *
+ * The continuation prompt is not a fixed string: it is rendered from measured
+ * facts (how often this session compacted inside a sliding window, the digest
+ * the backend wrote, the pending todo list, whether the session actually
+ * carries a delegation tool) and escalates with frequency. Above
+ * `resumeMaxPerWindow` automatic compactions the guard stops waking the agent
+ * entirely — a compaction/resume loop that keeps repeating burns tokens
+ * without changing the working style that causes it.
+ *
  * All injected content is user-role context stamped with the plugin source
  * (`{ kind: 'plugin', plugin: 'context-guard' }`), so it is durable in the
  * session log and reconstructable (model-visible ⟺ logged).
@@ -27,6 +35,8 @@
  * @module dsh-context-guard
  */
 
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
@@ -38,11 +48,32 @@ import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import type {} from '@deepseek-ai/dsh-settings'
+import { DIGEST_FORMAT_VERSION, digestPathFrom, estimateTextTokens } from './digest.ts'
+import { createLogSink, logInfo, logWarn } from './log.ts'
+import { digestPointerCandidates } from './paths.ts'
+import {
+  DEFAULT_RESUME_PROMPT,
+  DEFAULT_WRAP_UP_PROMPT,
+  buildWrapUpPrompt,
+  decideResume,
+} from './resume-prompt.ts'
+import {
+  availableToolNames,
+  checkpointText,
+  compactionPace,
+  lastHumanIntent,
+  pendingTodos,
+} from './session-facts.ts'
+import { SETTINGS_DEFAULTS, SETTINGS_NAMESPACE, overridesOf, settingsSchema, withDefaults } from './settings.ts'
+import type { ContextGuardSettingsValue, ThresholdOverrides } from './settings.ts'
 
 export const name = 'context-guard'
 
 /** Required services: routed-model metadata, token measurement, and the live agent registry. */
 export const inject = ['llm', 'tokenMeter', 'agents']
+
+/** Default delegation-capable tool names, matched against the session's request header. */
+const DEFAULT_DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow', 'ralph']
 
 /**
  * Plugin config, validated by the same-named schemastery schema. An empty
@@ -63,31 +94,21 @@ export interface Config {
   wrapUpPrompt?: string
   /**
    * Continuation prompt queued as a new turn after a successful compaction
-   * (default asks the agent to continue the task it was working on).
+   * (default asks the agent to continue from the archived state).
    */
   resumePrompt?: string
   /** Whether an over-threshold idle session is compacted automatically (default `true`). */
   autoCompactOnIdle?: boolean
   /** Whether a completed compaction resumes the idle agent (default `true`). */
   resumeAfterCompact?: boolean
+  /**
+   * Tool names that count as delegation-capable when the guard suggests
+   * splitting context-hungry work (default `subagent`, `subagent_fork`,
+   * `workflow`, `ralph`). A name absent from the session's request header is
+   * never suggested.
+   */
+  delegationTools?: string[]
 }
-
-/**
- * Default wrap-up reminder: finish the current task, write an optional handoff
- * note, and close the turn with a self-contained recap — the context is about
- * to be cut down to that recap plus an archival pointer frame.
- */
-const DEFAULT_WRAP_UP_PROMPT =
-  '当前会话上下文已接近上限，即将被截断为「本回复 + 归档指针」。请立即收尾：\n'
-  + '1) 若任务尚未完成，把关键状态写入工作区 .handoff/ 目录下的一个 md 文件'
-  + '（涉及的文件路径、已做决策、未完成项、下一步），文件名自定，并在下面的接力总结中给出该路径；\n'
-  + '2) 在回复末尾输出一段 ≤200 字、自包含的接力总结（截断后它将是上下文里唯一的对话帧）；\n'
-  + '3) 不要启动新的子任务或继续深入探索，完成后停止。'
-
-/** Default continuation prompt: keep going after the compaction. */
-const DEFAULT_RESUME_PROMPT =
-  '上下文已压缩并归档（摘要帧中包含归档 md 的路径）。需要细节时用 read 工具按需读取该文件恢复状态，'
-  + '然后继续执行压缩前正在进行的任务，直到任务完成。'
 
 export const Config: z<Config> = z.object({
   // Unbounded on purpose: an out-of-range ratio is normalized in apply (with
@@ -98,6 +119,7 @@ export const Config: z<Config> = z.object({
   resumePrompt: z.string().default(DEFAULT_RESUME_PROMPT),
   autoCompactOnIdle: z.boolean().default(true),
   resumeAfterCompact: z.boolean().default(true),
+  delegationTools: z.array(z.string()).default(DEFAULT_DELEGATION_TOOLS),
 })
 
 /** The plugin source stamped on every injected context message. */
@@ -110,6 +132,8 @@ const PLUGIN_SOURCE = {
 const WRAP_UP_SUMMARY = '上下文超过阈值，已提醒 agent 收尾'
 /** One-line account of the post-compaction resume for collapsed transcript rows. */
 const RESUME_SUMMARY = '上下文已压缩，已恢复任务'
+/** One-line account of a suppressed resume for collapsed transcript rows. */
+const RESUME_HOLD_SUMMARY = '压缩过于频繁，已暂停自动续跑'
 
 /** Request pressure relative to the routed model's context capacity. */
 interface Pressure {
@@ -124,32 +148,6 @@ interface Pressure {
 }
 
 /**
- * Settings-provided absolute thresholds (in tokens) per provider route. The
- * `context-guard` settings namespace lets the web UI configure these; values
- * are merged over the config's percentage fallback. `0` means "not set".
- */
-interface ThresholdOverrides {
-  /** Global absolute threshold applied to every provider without an entry. */
-  defaultTokens: number
-  /** Per-provider absolute thresholds, keyed by provider route id. */
-  providerTokens: Map<string, number>
-}
-
-/** The settings namespace value: absolute token thresholds per provider. */
-interface ThresholdSettingsValue {
-  /** Global absolute threshold applied to every provider without an entry; `0` means unset. */
-  defaultThresholdTokens: number
-  /** Per-provider absolute thresholds, keyed by provider route id. */
-  providerThresholds: { provider: string; thresholdTokens: number }[]
-}
-
-/** The composition fallback: no settings layer configured means every value unset. */
-const EMPTY_THRESHOLDS: ThresholdSettingsValue = {
-  defaultThresholdTokens: 0,
-  providerThresholds: [],
-}
-
-/**
  * The one `agentPresets` seam method the guard reads: the service instance an
  * agent's preset mounted behind an `isolate` realm. Such an instance is
  * invisible to every context outside the preset group — including the host
@@ -157,24 +155,6 @@ const EMPTY_THRESHOLDS: ThresholdSettingsValue = {
  */
 interface PresetServiceSeam {
   serviceFor<K extends string & keyof Context>(agent: { ctx: Context }, name: K): Context[K] | undefined
-}
-
-/** The settings namespace schema: absolute token thresholds per provider. */
-const settingsSchema: z<ThresholdSettingsValue> = z.object({
-  defaultThresholdTokens: z.number().step(1).min(0).default(0),
-  providerThresholds: z.array(z.object({
-    provider: z.string().required(),
-    thresholdTokens: z.number().step(1).min(1).required(),
-  })).default([]),
-})
-
-/** Extract the live threshold overrides from a resolved settings value. */
-function overridesOf(value: ThresholdSettingsValue): ThresholdOverrides {
-  const providerTokens = new Map<string, number>()
-  for (const entry of value.providerThresholds) {
-    providerTokens.set(entry.provider, entry.thresholdTokens)
-  }
-  return { defaultTokens: value.defaultThresholdTokens, providerTokens }
 }
 
 /** One session's over-threshold episode state; entries are GC'd with the session. */
@@ -192,6 +172,29 @@ interface EpisodeState {
 }
 
 /**
+ * Resolve one template through the shared precedence: the settings value wins
+ * whenever it is present, else the composition config, else the built-in text.
+ *
+ * The composition value is already baked into the settings base layer at
+ * registration (`baseSettings`), so the resolved settings value is normally the
+ * effective one and must be taken *verbatim* — including the empty string.
+ * Clearing a template field in the Web panel is how a user disables that
+ * injection, and a `length > 0` guard here would silently fall back to the
+ * composition text, making the injection impossible to turn off from the UI
+ * (found by browser verification on 2026-09-12).
+ */
+function pickTemplate(settingValue: string | undefined, configValue: string | undefined, builtin: string): string {
+  if (settingValue !== undefined) return settingValue
+  return configValue ?? builtin
+}
+
+/** Absolute path of a raw archive referenced anywhere in one frame text. */
+function rawPathFrom(text: string): string | undefined {
+  const fenced = [...text.matchAll(/`([^`\n]*\.raw\.md)`/g)].map(match => match[1] ?? '')
+  return fenced.length > 0 ? fenced[fenced.length - 1] : undefined
+}
+
+/**
  * Install the guard's listeners.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
  * @param config - validated {@link Config}; schemastery's `.default()` guarantees
@@ -200,41 +203,58 @@ interface EpisodeState {
  *   never take the host process down.
  */
 export function apply(ctx: Context, config: Config = {}): void {
+  // One sink for the whole plugin: cordis logger plus the console line that is
+  // actually observable in a composition with no logger exporter.
+  const log = createLogSink(ctx.logger)
   let thresholdRatio = config.thresholdRatio as number
   const wrapUpPrompt = config.wrapUpPrompt as string
   const resumePrompt = config.resumePrompt as string
   const autoCompactOnIdle = config.autoCompactOnIdle as boolean
   const resumeAfterCompact = config.resumeAfterCompact as boolean
+  const delegationTools = config.delegationTools as string[]
   if (!Number.isFinite(thresholdRatio) || thresholdRatio < 0 || thresholdRatio > 1) {
-    ctx.logger.error(
-      `context-guard: invalid thresholdRatio ${thresholdRatio} — must be a finite number in [0, 1]; using default 0.85`,
-    )
+    logWarn(log, '', 'invalid-threshold-ratio', { value: thresholdRatio, fallback: 0.85 })
     thresholdRatio = 0.85
   }
+
+  // The composition base layer: config-derived templates plus the built-in
+  // defaults, so `scope.get()` alone already answers "settings > config >
+  // default" and a composition that never mounts a settings provider degrades
+  // to exactly the config it declared.
+  const baseSettings: ContextGuardSettingsValue = {
+    ...SETTINGS_DEFAULTS,
+    wrapUpPromptTemplate: wrapUpPrompt,
+    resumePromptTemplate: resumePrompt,
+  }
+  let settingsValue: Partial<ContextGuardSettingsValue> = baseSettings
+  let thresholds: ThresholdOverrides | undefined
 
   // The settings seam is optional: without a provider the guard falls back to
   // the config's percentage ratio. Registration waits on the settings service
   // via ctx.inject (declarative, retried on service changes) rather than
   // reading ctx.get('settings') once at apply time — the eager read could run
   // before the settings provider finished loading and silently skip
-  // registration forever. The composition entry (no base layer) is the
-  // fallback source.
-  let thresholds: ThresholdOverrides | undefined
-  let settingsSource: () => ThresholdSettingsValue = () => EMPTY_THRESHOLDS
+  // registration forever.
   ctx.inject(['settings'], (settingsCtx) => {
-    // register + watch 组合: 不依赖 SettingsProvider 实例方法(installSection)
-    // 的 this.ctx, 便于宿主组合与测试桩都可用。
-    const scope = settingsCtx.settings.register('context-guard', settingsSchema, {
-      base: EMPTY_THRESHOLDS,
+    const scope = settingsCtx.settings.register(SETTINGS_NAMESPACE, settingsSchema, {
+      base: baseSettings,
     })
-    settingsSource = () => scope.get()
-    thresholds = overridesOf(settingsSource())
-    scope.watch(() => { thresholds = overridesOf(settingsSource()) })
+    settingsValue = scope.get()
+    thresholds = overridesOf(settingsValue)
+    scope.watch(() => {
+      settingsValue = scope.get()
+      thresholds = overridesOf(settingsValue)
+    })
     settingsCtx.effect(() => () => {
-      settingsSource = () => EMPTY_THRESHOLDS
+      settingsValue = baseSettings
       thresholds = undefined
     }, 'context-guard settings source')
   })
+
+  /** The resolved settings value with every absent field defaulted. */
+  function settings(): ContextGuardSettingsValue {
+    return withDefaults(settingsValue)
+  }
 
   /**
    * The absolute token threshold in force for one provider route: the
@@ -312,18 +332,42 @@ export function apply(ctx: Context, config: Config = {}): void {
       state.pendingReminder = undefined
       return
     }
-    if (state.warned || wrapUpPrompt.length === 0) return
+    const template = pickTemplate(settings().wrapUpPromptTemplate, wrapUpPrompt, DEFAULT_WRAP_UP_PROMPT)
+    if (state.warned || template.length === 0) return
     if (!stepOwesMoreWork(agent.session, turn, step)) return
     state.pendingReminder = createUserMessage({
-      content: [{ type: 'text', text: wrapUpPrompt }],
+      content: [{ type: 'text', text: buildWrapUpPrompt(template, pendingTodos(agent.session)) }],
       source: pluginSource(WRAP_UP_SUMMARY),
     })
     state.warned = true
-    ctx.logger.info(
-      `context-guard: ${agent.id} at ${pressure.totalTokens} of `
-      + `${thresholdTokensFor(pressure.provider, pressure.contextWindow)}-token threshold `
-      + `(${Math.round(pressure.ratio * 100)}% of ${pressure.contextWindow}); queued wrap-up reminder`,
-    )
+    logInfo(log, '', 'wrap-up-queued', {
+      agent: agent.id,
+      tokens: pressure.totalTokens,
+      threshold: thresholdTokensFor(pressure.provider, pressure.contextWindow),
+      ratio: Math.round(pressure.ratio * 100),
+      window: pressure.contextWindow,
+    })
+  }
+
+  /**
+   * The digest the backend wrote for one compaction: taken from the checkpoint
+   * frame (authoritative and configuration-independent), else probed from the
+   * default archive base as a fallback.
+   */
+  async function digestPathFor(agent: Agent, frame: string): Promise<string | undefined> {
+    const fromFrame = digestPathFrom(frame)
+    if (fromFrame !== undefined) return fromFrame
+    const cwd = agent.session.header?.cwd
+    if (cwd === undefined || cwd.length === 0) return undefined
+    for (const candidate of digestPointerCandidates(path.join(cwd, '.handoff'), String(agent.session.id))) {
+      try {
+        const value = (await readFile(candidate, 'utf8')).trim()
+        if (value.length > 0) return value
+      } catch {
+        // Missing pointer: try the next layout.
+      }
+    }
+    return undefined
   }
 
   ctx.on('session/event', (session, event) => {
@@ -336,12 +380,16 @@ export function apply(ctx: Context, config: Config = {}): void {
       state.evaluation = state.evaluation
         .then(() => evaluateStepEnd(agent, event.data.turn, event.data.step, state))
         .catch((error: unknown) => {
-          ctx.logger.warn(`context-guard: step-end evaluation failed for ${agent.id}: ${String(error)}`)
+          logWarn(log, '', 'step-end-failed', { agent: agent.id, error: String(error) })
         })
       return
     }
     if (event.type !== 'compaction/end') return
-    if (event.data.error !== undefined || resumePrompt.length === 0 || !resumeAfterCompact) return
+    if (event.data.error !== undefined) {
+      logWarn(log, 'resume', 'skipped', { reason: 'compaction-error', error: event.data.error })
+      return
+    }
+    if (!resumeAfterCompact) return
     // A stale wrap-up reminder must not steer the resumed turn.
     stateOf(session).pendingReminder = undefined
     const agent = ctx.agents.get(session.id)
@@ -349,18 +397,64 @@ export function apply(ctx: Context, config: Config = {}): void {
     // Deferred: this listener runs inside the compaction/end append dispatch,
     // and appending the follow-up splice would reenter that publication.
     queueMicrotask(() => {
-      try {
-        if (agent.status !== 'idle') return
-        agent.followup(createUserMessage({
-          content: [{ type: 'text', text: resumePrompt }],
-          source: pluginSource(RESUME_SUMMARY),
-        }))
-        ctx.logger.info(`context-guard: resumed ${agent.id} after compaction`)
-      } catch (error: unknown) {
-        ctx.logger.warn(`context-guard: resume after compaction failed for ${agent.id}: ${String(error)}`)
-      }
+      void resumeAfter(agent, String(event.data.compactionId))
     })
   })
+
+  /** Render and deliver (or deliberately withhold) the post-compaction continuation. */
+  async function resumeAfter(agent: Agent, compactionId: string): Promise<void> {
+    try {
+      if (agent.status !== 'idle') return
+      const resolved = settings()
+      const template = pickTemplate(resolved.resumePromptTemplate, resumePrompt, DEFAULT_RESUME_PROMPT)
+      if (template.length === 0) return
+      const frame = checkpointText(agent.session, compactionId)
+      const digestPath = await digestPathFor(agent, frame)
+      const rawPath = rawPathFrom(frame)
+      const pace = compactionPace(agent.session, Date.now(), resolved.resumeWindowMinutes)
+      const delegation = availableToolNames(agent.session)
+        .filter(tool => delegationTools.includes(tool))
+      const decision = decideResume(template, {
+        compactionsInWindow: pace.autoInWindow,
+        windowMinutes: resolved.resumeWindowMinutes,
+        maxPerWindow: resolved.resumeMaxPerWindow,
+        epoch: pace.sessionTotal,
+        digestPath,
+        rawPath,
+        todos: pendingTodos(agent.session),
+        intent: lastHumanIntent(agent.session),
+        delegationTools: delegation,
+      }, { escalation: resolved.resumeEscalation })
+      const promptTokens = estimateTextTokens(decision.prompt, resolved.digestTokenEstimator)
+      if (decision.suppress) {
+        logWarn(log, 'resume', 'suppressed', {
+          agent: agent.id,
+          compaction: pace.sessionTotal,
+          inWindow: pace.autoInWindow,
+          window: resolved.resumeWindowMinutes,
+        })
+        agent.send(createUserMessage({
+          content: [{ type: 'text', text: decision.prompt }],
+          source: pluginSource(RESUME_HOLD_SUMMARY),
+        }), 'next-turn', false)
+        return
+      }
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: decision.prompt }],
+        source: pluginSource(RESUME_SUMMARY),
+      }))
+      logInfo(log, 'resume', 'sent', {
+        agent: agent.id,
+        compaction: pace.sessionTotal,
+        inWindow: pace.autoInWindow,
+        level: decision.level,
+        digest: digestPath,
+        promptTokens,
+      })
+    } catch (error: unknown) {
+      logWarn(log, 'resume', 'failed', { agent: agent.id, error: String(error) })
+    }
+  }
 
   // Fold a pending wrap-up reminder into the entering messages after the
   // claimed batch, so it reaches the very next request deterministically
@@ -383,7 +477,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, reminder)
       return { ...decision, messages: entered }
     } catch (error: unknown) {
-      ctx.logger.warn(`context-guard: pre-step fold failed for ${agent.id}: ${String(error)}`)
+      logWarn(log, '', 'pre-step-fold-failed', { agent: agent.id, error: String(error) })
       return next()
     }
   })
@@ -429,24 +523,29 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (compaction === undefined) {
         if (!warnedNoProvider) {
           warnedNoProvider = true
-          ctx.logger.warn('context-guard: no compaction provider loaded; idle auto-compaction is disabled')
+          logWarn(log, '', 'no-compaction-provider', { note: 'idle auto-compaction disabled' })
         }
         return
       }
       const result = await compaction.compactNow(agent, compactionSignal)
       if (result !== null) {
         state.compacted = true
-        ctx.logger.info(
-          `context-guard: ${agent.id} idle at ${pressure.totalTokens} of `
-          + `${thresholdTokensFor(pressure.provider, pressure.contextWindow)}-token threshold `
-          + `(${Math.round(pressure.ratio * 100)}% of ${pressure.contextWindow}); `
-          + `compacted ${result.shadowedSeqs.length} surface nodes`,
-        )
+        logInfo(log, '', 'idle-compacted', {
+          agent: agent.id,
+          tokens: pressure.totalTokens,
+          threshold: thresholdTokensFor(pressure.provider, pressure.contextWindow),
+          ratio: Math.round(pressure.ratio * 100),
+          window: pressure.contextWindow,
+          shadowed: result.shadowedSeqs.length,
+        })
       }
     } catch (error: unknown) {
-      ctx.logger.warn(`context-guard: idle compaction failed for ${agent.id}: ${String(error)}`)
+      logWarn(log, '', 'idle-compaction-failed', { agent: agent.id, error: String(error) })
     } finally {
       state.compacting = false
     }
   }
 }
+
+/** Re-exported for tests and host-side consumers. */
+export { DIGEST_FORMAT_VERSION }
