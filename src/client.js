@@ -122,10 +122,22 @@ window.__ModuleLoader__.load({
       // 这是内禀布局，不依赖视口宽度，所以在「宽视口 + 窄内容区」的壳里同样成立。
       '.cg-grid2{display:flex;flex-wrap:wrap;gap:12px}',
       '.cg-grid2>*{flex:1 1 200px;min-width:0}',
+      // 保存行常驻：设置弹窗在手机上只有 ~510px 的滚动窗口，而本分节有 15 项、
+      // 实测高 ~2100px（两个分组 1558px + 16 条说明 666px），保存按钮原本排在最后，
+      // 要连滑三次才看得到 —— 用户报「移动端无法滚动、看不到下方的保存」即此。
+      // 把保存行做成 sticky 贴在滚动区底部，保存与状态永远在屏幕上，够不够滚不再是前提。
+      // 底色用弹窗同一套 surface token（浅色主题下即弹窗的 #fff），否则滚动时会透出内容。
+      '.cg-actions{position:sticky;bottom:0;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:2px;padding:10px 0 6px;background:var(--dsw-alias-bg-base,#fff);border-top:1px solid var(--dsw-alias-border-l1,#dbe1e8)}',
+      // 状态在左、按钮在右：长报错文案要能换行，且不许把按钮挤扁（flex 收缩默认允许）。
+      '.cg-actions>.cg-status{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}',
+      '.cg-actions>.cg-btn{flex:0 0 auto}',
       // 窄屏（手机 WebView 的 CSS 视口约 380–430px）一律单列：两列时每格只剩 ~180px，
       // 标签折成两三行、下拉被截断、说明文字变成窄条。这里按视口宽度收口（宽屏设置
       // 弹窗视口仍 ≥1000px，两列观感不变），比按容器宽度判断更可预期。
-      '@media (max-width:640px){.cg-grid2{grid-template-columns:minmax(0,1fr)}}',
+      '@media (max-width:640px){.cg-grid2{gap:10px}}',
+      // 手机上再收一档间距与字号：滚动窗口本来就小，省下的都是要滑的距离。
+      '@media (max-width:640px){.cg-root{gap:10px;padding-bottom:4px}.cg-group{gap:9px;padding:10px}.cg-hint{font-size:11px;line-height:16px}}',
+      '@media (max-width:640px){.cg-grid2>*{flex-basis:100%}}',
       '@media (max-width:640px){.cg-row{grid-template-columns:minmax(0,1fr)}.cg-row>*{width:100%}}',
     ].join('\n')
 
@@ -453,13 +465,14 @@ window.__ModuleLoader__.load({
             () => setResume({ ...resume, wrapTemplate: base.wrapUpPromptTemplate ?? '' })),
         ),
 
-        React.createElement('div', { className: 'cg-row', style: { gridTemplateColumns: '1fr auto' } },
-          React.createElement('span', null),
+        // 保存行与状态必须同在一个 sticky 容器里：状态留在末尾就落在容器之外，
+        // 贴底只剩一个按钮，且状态更新时还会把容器高度顶变（sticky 行会跳）。
+        React.createElement('div', { className: 'cg-actions' },
+          status !== null
+            ? React.createElement('div', { className: status.error ? 'cg-status error' : 'cg-status' }, status.text)
+            : React.createElement('span', null),
           React.createElement('button', { className: 'cg-btn primary', onClick: () => void save() }, T.save),
         ),
-        status !== null
-          ? React.createElement('div', { className: status.error ? 'cg-status error' : 'cg-status' }, status.text)
-          : null,
       )
     }
 
