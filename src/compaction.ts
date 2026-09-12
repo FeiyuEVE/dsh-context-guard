@@ -89,6 +89,7 @@ const archivePolicyKeys = {
   digestTargetRatio: z.number().min(0.05).max(0.95).default(0.45),
   digestCarryForward: z.boolean().default(true),
   digestTokenEstimator: z.union([z.const('cjk'), z.const('ascii')]).default('cjk'),
+  writeRawArchive: z.boolean().default(false),
   rawExcludeInjected: z.boolean().default(false),
   archiveLayout: z.union([z.const('session'), z.const('flat')]).default('session'),
 } as const
@@ -136,6 +137,7 @@ function splitConfig(config: Record<string, unknown>): {
     digestTargetRatio,
     digestCarryForward,
     digestTokenEstimator,
+    writeRawArchive,
     rawExcludeInjected,
     archiveLayout,
     ...basic
@@ -148,6 +150,7 @@ function splitConfig(config: Record<string, unknown>): {
     ...digestTokenEstimator === 'cjk' || digestTokenEstimator === 'ascii'
       ? { estimator: digestTokenEstimator }
       : {},
+    ...typeof writeRawArchive === 'boolean' ? { writeRaw: writeRawArchive } : {},
     ...typeof rawExcludeInjected === 'boolean' ? { rawExcludeInjected } : {},
     ...archiveLayout === 'session' || archiveLayout === 'flat' ? { layout: archiveLayout } : {},
   }

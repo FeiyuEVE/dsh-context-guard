@@ -49,7 +49,18 @@ export interface ContextGuardSettingsValue {
   digestCarryForward: boolean
   /** Token estimator used for digest budgeting. */
   digestTokenEstimator: DigestEstimator
-  /** Whether the lossless raw archive also drops host-re-injected context. */
+  /**
+   * Whether a compaction also writes the lossless raw transcript archive.
+   *
+   * Off by default: the point of this plugin's side-car is the **0-token
+   * digest**, a document small enough to read at handoff time. The raw archive
+   * is the whole compacted region re-dumped (measured: 401 messages → 286 KB
+   * ≈ 64k tokens, 65.6% of it tool results) — nobody reads that at handoff, and
+   * writing it costs ~300 KB per compaction with no retention policy. Turn it on
+   * when you want the region kept verbatim for later grepping.
+   */
+  writeRawArchive: boolean
+  /** Whether the raw archive also drops host-re-injected context (raw only). */
   rawExcludeInjected: boolean
   /** Archive layout below the base directory. */
   archiveLayout: ArchiveLayout
@@ -74,6 +85,7 @@ export const SETTINGS_DEFAULTS: ContextGuardSettingsValue = {
   digestTargetRatio: 0.45,
   digestCarryForward: true,
   digestTokenEstimator: 'cjk',
+  writeRawArchive: false,
   rawExcludeInjected: false,
   archiveLayout: 'session',
   resumeEscalation: true,
@@ -95,6 +107,7 @@ export const settingsSchema: z<ContextGuardSettingsValue> = z.object({
   digestTargetRatio: z.number().min(0.05).max(0.95).default(0.45),
   digestCarryForward: z.boolean().default(true),
   digestTokenEstimator: z.union([z.const('cjk'), z.const('ascii')]).default('cjk'),
+  writeRawArchive: z.boolean().default(false),
   rawExcludeInjected: z.boolean().default(false),
   archiveLayout: z.union([z.const('session'), z.const('flat')]).default('session'),
   resumeEscalation: z.boolean().default(true),
@@ -114,6 +127,7 @@ export function withDefaults(value: Partial<ContextGuardSettingsValue> | undefin
     digestTargetRatio: value?.digestTargetRatio ?? SETTINGS_DEFAULTS.digestTargetRatio,
     digestCarryForward: value?.digestCarryForward ?? SETTINGS_DEFAULTS.digestCarryForward,
     digestTokenEstimator: value?.digestTokenEstimator ?? SETTINGS_DEFAULTS.digestTokenEstimator,
+    writeRawArchive: value?.writeRawArchive ?? SETTINGS_DEFAULTS.writeRawArchive,
     rawExcludeInjected: value?.rawExcludeInjected ?? SETTINGS_DEFAULTS.rawExcludeInjected,
     archiveLayout: value?.archiveLayout ?? SETTINGS_DEFAULTS.archiveLayout,
     resumeEscalation: value?.resumeEscalation ?? SETTINGS_DEFAULTS.resumeEscalation,
@@ -155,6 +169,8 @@ export interface EngineDigestConfig {
   carryForward?: boolean | undefined
   /** See {@link ContextGuardSettingsValue.digestTokenEstimator}. */
   estimator?: DigestEstimator | undefined
+  /** See {@link ContextGuardSettingsValue.writeRawArchive}. */
+  writeRaw?: boolean | undefined
   /** See {@link ContextGuardSettingsValue.rawExcludeInjected}. */
   rawExcludeInjected?: boolean | undefined
   /** See {@link ContextGuardSettingsValue.archiveLayout}. */
@@ -173,6 +189,8 @@ export interface ResolvedDigestConfig {
   carryForward: boolean
   /** See {@link ContextGuardSettingsValue.digestTokenEstimator}. */
   estimator: DigestEstimator
+  /** See {@link ContextGuardSettingsValue.writeRawArchive}. */
+  writeRaw: boolean
   /** See {@link ContextGuardSettingsValue.rawExcludeInjected}. */
   rawExcludeInjected: boolean
   /** See {@link ContextGuardSettingsValue.archiveLayout}. */
@@ -196,6 +214,7 @@ export function resolveDigestConfig(
     targetRatio: user?.digestTargetRatio ?? entry?.targetRatio ?? SETTINGS_DEFAULTS.digestTargetRatio,
     carryForward: user?.digestCarryForward ?? entry?.carryForward ?? SETTINGS_DEFAULTS.digestCarryForward,
     estimator: user?.digestTokenEstimator ?? entry?.estimator ?? SETTINGS_DEFAULTS.digestTokenEstimator,
+    writeRaw: user?.writeRawArchive ?? entry?.writeRaw ?? SETTINGS_DEFAULTS.writeRawArchive,
     rawExcludeInjected: user?.rawExcludeInjected ?? entry?.rawExcludeInjected ?? SETTINGS_DEFAULTS.rawExcludeInjected,
     layout: user?.archiveLayout ?? entry?.layout ?? SETTINGS_DEFAULTS.archiveLayout,
   }

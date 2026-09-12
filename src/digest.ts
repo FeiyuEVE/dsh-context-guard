@@ -627,17 +627,22 @@ function renderTerse(facts: DigestFacts): string {
 
 /** The document header: identity and budget facts, never a wall clock. */
 function renderHeader(meta: DigestMeta, bodyTokens: number): string {
-  return [
+  const lines = [
     DIGEST_MARKER,
     `# 接力摘要（会话 ${meta.sessionId} · 第 ${meta.epoch} 次压缩）`,
     '',
     `- 会话: ${meta.sessionId}`,
     `- 第几次: ${meta.epoch}`,
-    `- 原始档: ${meta.rawPath ?? '（本次未落盘）'}`,
+  ]
+  // The raw transcript is opt-in, so its absence is the ordinary case rather
+  // than a failure to report: say nothing instead of `（本次未落盘）`.
+  if (meta.rawPath !== undefined) lines.push(`- 原始档: ${meta.rawPath}`)
+  lines.push(
     `- 截断区间: ${meta.regionMessages} 条消息 / ${meta.regionToolCalls} 次工具调用（≈${meta.regionTokens} tokens）`,
     `- 继承: ${meta.carriedFrom === undefined ? '无' : `第 ${meta.carriedFrom} 次`}`,
     `- 摘要正文: ≈${bodyTokens} tokens（确定性抽取，未调用模型）`,
-  ].join('\n')
+  )
+  return lines.join('\n')
 }
 
 /** Hard-truncate a body so even a pathological budget terminates. */

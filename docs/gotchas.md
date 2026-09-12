@@ -87,9 +87,10 @@
   （`compactionPace().sessionTotal + 1`，与收尾笔记 `{{epoch}}` 同源），引擎只管扫描。
   低报不会让序号倒退（扫描优先），高报只是留空洞 —— **任何一侧都不允许重号覆盖别人**。
 - **落点**（默认 `session` 布局）：`<archiveDir 或 cwd>/.handoff/sessions/<sessionDirName(会话id)>/`
-  下 `epoch-<N>.raw.md` + `epoch-<N>.digest.md` + `latest.txt` + `latest-digest.txt`；N 在本会话目录
-  内递增。目录名用**完整会话 id**，清洗改变原 id 时附 `-<sha256[0..8]>`。`archiveLayout: 'flat'` 保留
-  旧行为（无隔离），**299 份历史 flat 归档不迁移**。写失败仅 warn 不抛。
+  下默认只有 `epoch-<N>.digest.md` + `latest-digest.txt`；开启 `writeRawArchive` 时才多出
+  `epoch-<N>.raw.md` + `latest.txt`。N 在本会话目录内递增。目录名用**完整会话 id**，清洗改变原 id
+  时附 `-<sha256[0..8]>`。`archiveLayout: 'flat'` 保留旧行为（无隔离），**299 份历史 flat 归档不迁移**。
+  写失败仅 warn 不抛。
 - **digest 必须剔除宿主重发注入**（`isInjectedContext`：agent-instructions/skill-catalog/system 及
   context-guard 的 snapshot/instructions/catalog/notice）：实测这些占了 raw 归档的大部分体积，写进
   digest 是纯浪费。格式契约改动必须 bump `DIGEST_FORMAT_VERSION`（见 `docs/digest-format.md` §8）。
@@ -138,15 +139,21 @@
   丢其余 C0/DEL（留 `\t`/`\n`）。**代价是 raw 不再是逐字节无损**；逐字节原文仍在会话日志里。
   **排查口径**：`python3 -c "print(open(p,'rb').read().count(b'\x00'))"`，或
   `grep -c $'\x00' <file>`；改归档渲染后要同时看「文件里有没有 NUL」和「有没有残留 `[1;34m`」。
-- **raw 是记录，不是摘要；别把它写成「可以读」的东西（2026-09-12 用户提问发现）**：用户看到
-  `epoch-6.raw.md` 有 286 KB，问「为什么 raw 这么长，0 token 摘要去哪里了」。两个事实：
-  **摘要是 `epoch-N.digest.md`**（同一目录、2208 B / ≈478 tokens、零模型调用），raw 是**被压缩那段的
-  完整记录**（401 条消息 / 204 次工具调用 → 286 KB / ≈64k tokens，其中工具结果占 65.6%、工具调用
-  JSON 占 26.9%、人/模型正文只占 7.6%）。它**不是**压缩产物，所以「越短越好」不适用于它 —— 但正因
-  如此，**任何「需要细节时再读」的说法都是错的**：整份读进来 ≈ 把刚压缩掉的上下文填回去。0.3.8 起
-  声明块带体积并写明「按需检索用，不要整份读入……先 grep 定位，再局部 read」。
-  **推论**：凡是把大文件路径喂给 agent 的地方，都要同时给**体积**和**读它的方式**，否则「不要求通读」
-  这种软话挡不住 read。
+- **raw 是记录，不是摘要；所以它最终被改成「按需开启」（2026-09-12 用户提问发现）**：用户看到
+  `epoch-6.raw.md` 有 286 KB，问「为什么 raw 这么长，0 token 摘要去哪里了」，随后明确「不需要把完整
+  的会话记录搞出来，只需要 0 token 摘要即可」。两个事实：**摘要是 `epoch-N.digest.md`**（同一目录、
+  2208 B / ≈478 tokens、零模型调用），raw 是**被压缩那段的完整记录**（401 条消息 / 204 次工具调用 →
+  286 KB / ≈64k tokens，其中工具结果占 65.6%、工具调用 JSON 占 26.9%、人/模型正文只占 7.6%）。
+  它**不是**摘要，所以「越短越好」不适用于它；但它的体量与被压缩掉的区间同量级，**留着就等于一份
+  随时会被整份读回来的第二份上下文**。
+  **结论（0.4.0）**：`writeRawArchive` 默认 `false`，默认只写 digest 与 `latest-digest.txt`；raw 与
+  `latest.txt` 仅在显式开启时落盘，跳过时记一行 `raw-skipped`。0.3.8 那版「声明块带体积 + 写明先
+  grep 再局部 read」只是缓解，因为软话挡不住 read。
+  **连带坑**：`nextEpoch()` 原本只扫 `*.raw.md`，关掉 raw 后序号每次从 1 重来，会**覆盖上一份 digest
+  并让 carry-forward 失效**。现在编号正则同时覆盖 `*.raw.md` 与 `*.digest.md` —— 改编号逻辑前先确认
+  两种后缀都在。回归用例见 `tests/archive.spec.ts` 的 `raw transcript is opt-in`。
+  **推论**：凡是把大文件路径喂给 agent 的地方，都要同时给**体积**和**读它的方式**；而更好的做法是
+  默认根本不产生那份大文件。
 - **确定性抽取会把「谈论错误」当成「发生错误」**：错误判据不能只看关键词。实测一条成功的
   `echo '=== 该错误是否历史就有…==='` 被记进「报错与修复」。现在非 error 块还要求**诊断形态**
   `^\S{1,32}:\s*\S`（`sh: 1: ps: not found` 命中，`=== … ===` 不命中）。同类问题还有

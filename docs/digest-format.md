@@ -7,17 +7,22 @@
 
 ## 1. 为什么有第二个文件
 
-被裁区间已经被**无损**导成 `epoch-N.raw.md`（0.3.5 起由共用写盘器 `src/archive.ts` 产出，默认走
-守卫的旁挂路径，见 §7）。那个文件很贵：本工作区一个真实
-epoch 约 30 KB ≈ 8k tokens，读回来几乎抵掉这次压缩省下的量。所以每次压缩写**两份**产物：
+被裁区间可以被**逐字**导成 `epoch-N.raw.md`（由共用写盘器 `src/archive.ts` 产出，默认走守卫的
+旁挂路径，见 §7）。那个文件很贵：本工作区一个真实 epoch 实测 ≈286 KB ≈ **64k tokens**（401 条
+消息 / 204 次工具调用，工具结果占 65.6%），与被压缩掉的区间同量级，整份读回来等于把刚腾出的
+空间又填满。所以：
+
+- **默认只写 digest**（`writeRawArchive: false`，0.4.0 起）；
+- 显式开启 `writeRawArchive` 时，每次压缩写**两份**产物：
 
 | 文件 | 性质 | 谁读 | 典型体量 |
 |---|---|---|---|
-| `epoch-N.raw.md` | 无损全文（逐角色逐块） | 需要精确原文时按需 `read` | ~30 KB |
 | `epoch-N.digest.md` | **确定性事实清单**（不调用模型） | 续跑后**第一份**要读的文档 | ≤ 800 tokens（默认） |
+| `epoch-N.raw.md` | 逐字全文（逐角色逐块），**按需开启** | 需要精确原文时先 `grep` 再局部 `read` | ~286 KB / ≈64k tokens |
 
 digest 不是「模型写的摘要」，它是**纯代码抽取的事实列表**：意图原文、涉及文件与读写次数、报错行、
-待办、重复调用。设计上它不试图理解内容，因此零模型调用、零 token 成本、逐字节可复现。
+待办、重复调用。设计上它不试图理解内容，因此零模型调用、零 token 成本、逐字节可复现 —— 这才是
+「0 token 摘要」。raw 只是被裁区间的重录，**不是摘要**。
 
 压缩帧（进入上下文的那几句）**只带路径**，不带 digest 正文 —— digest 是「按需读」的文档，
 不是「提前塞进上下文」的内容。见 §7 的预算口径。
@@ -30,22 +35,23 @@ digest 不是「模型写的摘要」，它是**纯代码抽取的事实列表**
 <base>/
   sessions/
     <session-dir>/            ← 目录名由 paths.ts:sessionDirName(Session.id) 推导
-      epoch-1.raw.md
-      epoch-1.digest.md
-      epoch-2.raw.md
+      epoch-1.digest.md       ← 默认产物
       epoch-2.digest.md
-      latest.txt              ← 「最新 raw 的绝对路径」，一行
       latest-digest.txt       ← 「最新 digest 的绝对路径」，一行
+      epoch-1.raw.md          ← 仅在 writeRawArchive 开启时
+      latest.txt              ← 「最新 raw 的绝对路径」，一行（同上）
 ```
 
 - `sessionDirName()`：字符白名单 `[A-Za-z0-9._-]`，越界字符替 `_`；可读部分截断到 128 字符；
   空/`.`/`..` → `session`。**只要规范化改变了原 id**，追加 `-<sha256(原id)[0..8]>`，保证两个
   不同 id 永不映射到同一目录（也保证 `Session.id` 含 `/` 或 `..` 时不会越目录写）。
 - 目录名用**完整会话 id**（非短前缀）：短前缀会撞名，而撞名即丢档。
-- epoch 号在**本会话目录内**递增（`^<epochPrefix>-\d+\.raw\.md$` 的最大值 +1），语义是
-  「本会话的第 N 次压缩」。`epochPrefix` 默认 `epoch`。
-- **写法**：每个文件 tmp + `rename` 原子落盘；写入顺序 raw → `latest.txt` → digest →
-  `latest-digest.txt`，指针最后移动。读者永不会在「指针已更新」时看到一个半截文档。
+- epoch 号在**本会话目录内**递增（`^<epochPrefix>-\d+\.(?:raw|digest)\.md$` 的最大值 +1），语义是
+  「本会话的第 N 次压缩」。`epochPrefix` 默认 `epoch`。**正则必须同时覆盖两种后缀**：只扫 `*.raw.md`
+  会在关闭 raw 时让序号每次从 1 重来，覆盖上一份 digest 并让 carry-forward 失效。
+- **写法**：每个文件 tmp + `rename` 原子落盘；开启 raw 时顺序 raw → `latest.txt` → digest →
+  `latest-digest.txt`，默认只走 digest → `latest-digest.txt`；指针最后移动。读者永不会在
+  「指针已更新」时看到一个半截文档。
 - `archiveLayout: 'flat'` 保留为兼容模式：直接写 `<base>/`，无 `sessions/` 层、无会话隔离，
   epoch 号与其他会话共享。**默认 `session`**；299 份历史 flat 归档不迁移（见 §9）。
 
@@ -57,7 +63,7 @@ digest 不是「模型写的摘要」，它是**纯代码抽取的事实列表**
 
 - 会话: <sessionId>                              ← 契约：carry-forward 用它判归属
 - 第几次: <N>                                    ← 契约：carry-forward 用它填「继承」来源
-- 原始档: <raw 绝对路径> | （本次未落盘）
+- 原始档: <raw 绝对路径>          ← 仅在本次写了 raw 时出现（writeRawArchive）
 - 截断区间: <消息数> 条消息 / <工具调用数> 次工具调用（≈<regionTokens> tokens）
 - 继承: 无 | 第 <M> 次
 - 摘要正文: ≈<tokens> tokens（确定性抽取，未调用模型）
@@ -178,7 +184,7 @@ targetTokens = max(260, min(digestMaxTokens, regionTokens × digestTargetRatio))
 ```
 本段历史已由 dsh-context-guard 确定性归档（未调用模型摘要请求）。
 - 精简接力摘要：`<digest 绝对路径>`
-- 完整归档：`<raw 绝对路径>`
+- 完整归档：`<raw 绝对路径>`                      ← 仅在 writeRawArchive 开启时
 - 线索：「<最多 60 字的首条意图/末条待办>」        ← 仅当 regionTokens ≥ 600
 需要细节时用 read 工具按需读取该文件恢复状态，不要在上下文中复述。
 请直接继续执行截断前正在进行的任务。
@@ -191,7 +197,7 @@ targetTokens = max(260, min(digestMaxTokens, regionTokens × digestTargetRatio))
   已经落盘确认过。
 
 **写盘时序是格式契约的一部分**：旁挂写盘在 `compaction/summary` 的监听器里**同步**跑完，所以后端
-追加替换消息（区间离开模型视野）时，本文件的 raw 与 digest 已经在盘上；两条路（接管 / 旁挂）现在
+追加替换消息（区间离开模型视野）时，本文件的 digest（以及开启时的 raw）已经在盘上；两条路（接管 / 旁挂）现在
 都满足「归档先于覆盖」。改 `src/archive.ts` 时不要把同步 I/O 换成 promise —— 详见
 `docs/gotchas.md`「旁挂归档必须同步落盘」。
 

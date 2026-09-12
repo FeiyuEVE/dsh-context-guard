@@ -723,6 +723,23 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     return dir
   }
 
+  /**
+   * Settings with the full transcript dump switched on.
+   *
+   * The side-car digest knobs are read from the settings layer only (the
+   * composition entry has no digest fields), so these tests must go through
+   * `fakeSettings` to get a `raw` member at all: since 0.4.0 the transcript is
+   * opt-in and the default ships the digest alone. `defaultThresholdTokens: 0`
+   * keeps threshold resolution on the composition/ratio path the tests expect.
+   */
+  function rawSidecar(): ReturnType<typeof fakeSettings> {
+    return fakeSettings({
+      defaultThresholdTokens: 0,
+      providerThresholds: [],
+      writeRawArchive: true,
+    })
+  }
+
   /** Cut once and wait for the post-cut continuation to settle. */
   async function cutOnce(
     compaction: StubCompactionEngine,
@@ -744,7 +761,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
       {},
       4000,
       true,
-      undefined,
+      rawSidecar(),
       undefined,
       cwd,
     )
@@ -791,7 +808,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
       {},
       4000,
       true,
-      undefined,
+      rawSidecar(),
       undefined,
       cwd,
     )
@@ -843,7 +860,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
       {},
       4000,
       true,
-      undefined,
+      rawSidecar(),
       undefined,
       cwd,
     )

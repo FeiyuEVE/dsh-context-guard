@@ -189,7 +189,9 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
       textResponse('wrapping up now'),
       textResponse('continuing after compaction'),
     ]
-    const { ctx, agent, adapter } = await bootLoop(script, archiveDir)
+    // The full transcript dump is opt-in (0.4.0): ask for it explicitly, since
+    // this test asserts on both members of the pair.
+    const { ctx, agent, adapter } = await bootLoop(script, archiveDir, { writeRawArchive: true })
 
     // The whole loop settles: two completed turns (original + resumed).
     await vi.waitFor(() => {
@@ -264,7 +266,7 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
         textResponse('after second cut'),
       ],
       archiveDir,
-      { retainTokens: 10 },
+      { retainTokens: 10, writeRawArchive: true },
       'mid '.repeat(180),
       // Wide window: the guard ratio (0.85 × window) must never trip across
       // two manual cuts, or its wrap-up/resume turns would race compactNow.
@@ -325,8 +327,8 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
     const archiveDir = await makeTmpDir()
     // Wide windows: the guard must never auto-trigger here, so both cuts are
     // the manual ones this test drives.
-    const first = await bootLoop([textResponse('a'), textResponse('b')], archiveDir, { retainTokens: 10 }, 'mid '.repeat(180), 2000, 'a1')
-    const second = await bootLoop([textResponse('a'), textResponse('b')], archiveDir, { retainTokens: 10 }, 'mid '.repeat(180), 2000, 'b2')
+    const first = await bootLoop([textResponse('a'), textResponse('b')], archiveDir, { retainTokens: 10, writeRawArchive: true }, 'mid '.repeat(180), 2000, 'a1')
+    const second = await bootLoop([textResponse('a'), textResponse('b')], archiveDir, { retainTokens: 10, writeRawArchive: true }, 'mid '.repeat(180), 2000, 'b2')
     await vi.waitFor(() => { expect(first.agent.status).toBe('idle') })
     await vi.waitFor(() => { expect(second.agent.status).toBe('idle') })
 
@@ -348,7 +350,7 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
     const { ctx, agent } = await bootLoop(
       [textResponse('a'), textResponse('b')],
       archiveDir,
-      { retainTokens: 10, archiveLayout: 'flat' },
+      { retainTokens: 10, archiveLayout: 'flat', writeRawArchive: true },
       'mid '.repeat(180),
       2000,
     )

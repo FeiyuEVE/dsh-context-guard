@@ -6,7 +6,7 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 
 ## 设置面板（Web UI）/ Settings UI
 
-浏览器端 `settings.section`「**上下文守卫**」，三组共 14 项，保存即生效（host 侧实时 `watch`
+浏览器端 `settings.section`「**上下文守卫**」，三组共 15 项，保存即生效（host 侧实时 `watch`
 `context-guard` settings 命名空间）。更新是**稀疏 patch**（只发本面板拥有的字段），不会碰其他插件
 的键。
 
@@ -36,16 +36,17 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
    提示并 `followup()` 唤醒，在压缩后的表层上续跑。失败、agent 运行中、或频率超上限时按规则不唤醒。
 4. **hook `compaction/summary`（旁挂归档）** —— 压缩由**别人**执行时（`standard` preset 的
    `compaction-basic`、手动 `/compact`），守卫把被遮蔽的区间取回来，按同一格式补写
-   `epoch-N.raw.md` + `epoch-N.digest.md`。**模型看到的 checkpoint 完全由 dsh 自己的压缩机决定**，
-   本插件只是往旁边加文件 —— 不覆写 `summarize()`、不改压缩事务。
+   `epoch-N.digest.md`（`epoch-N.raw.md` 全文归档默认关闭，见下）。**模型看到的 checkpoint 完全由
+   dsh 自己的压缩机决定**，本插件只是往旁边加文件 —— 不覆写 `summarize()`、不改压缩事务。
 
 ### 归档与接力摘要
 
 归档有**两条路**，产物格式相同、落点相同：
 
 - **旁挂（默认，零配置）**：任何后端压缩时，守卫从 `compaction/summary` 事件拿到被遮蔽的区间，
-  自己写 raw + digest。线上 `standard` preset 走 `compaction-basic`（模型摘要），压缩后模型看到的
-  仍是那份模型摘要 —— 归档只是**旁边多出来的文件**。手动 `/compact` 同理。
+  自己写 digest（开启 `writeRawArchive` 时另加 raw）。线上 `standard` preset 走 `compaction-basic`
+  （模型摘要），压缩后模型看到的仍是那份模型摘要 —— 归档只是**旁边多出来的文件**。手动 `/compact`
+  同理。
 - **接管（可选）**：把 preset 的 `compaction` 行换成插件自带的 `ArchiveCutEngine`（导出子路径
   `./compaction`）。它只覆写 `BasicCompactionEngine.summarize()` 这一个受支持的扩展点，**零模型调用**，
   checkpoint 本身就是「路径清单帧」。两种方式不会同时生效：`ArchiveCutEngine` 自己已经写完归档，
@@ -55,12 +56,18 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
 
 ```
 <cwd>/.handoff/sessions/<会话id>/
-  epoch-N.raw.md          无损全文归档（细节按需 read）
   epoch-N.digest.md       确定性事实摘要（续跑后第一份要读的文档）
+  epoch-N.raw.md          无损全文归档（**默认不写**，需开启 writeRawArchive）
   epoch-N.handoff.md      收尾接力笔记（**由 agent 按收尾提示词写**，不是引擎产物）
-  latest.txt              → 最新 raw 的绝对路径
   latest-digest.txt       → 最新 digest 的绝对路径
+  latest.txt              → 最新 raw 的绝对路径（仅开启 writeRawArchive 时）
 ```
+
+- **全文归档默认关闭（`writeRawArchive`，默认 false）**：raw 是被裁区间的**逐字重录**，实测一段
+  401 条消息 / 204 次工具调用的区间 = 286 KB ≈ **64k tokens**（其中工具结果占 65.6%），与被压缩掉的
+  体量同量级；整份读回来等于把压缩刚腾出的空间又填满。默认因此只留 digest（同一区间 2.2 KB ≈ 478
+  tokens），细节改从会话日志检索（`session.v3.jsonl.zstd`）。需要 raw 时在设置面板打开
+  「写完整原文归档」，或设 `writeRawArchive: true`。
 
 - **接力笔记也按会话分目录**：收尾提示词里的 `{{notePath}}` 由守卫算出（`epoch-N.handoff.md`，
   `N` = 本会话第几次压缩，即将发生的那次），并要求文件**首行标题**写成
@@ -68,8 +75,8 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
   所以「`.handoff/sessions/` 不存在」仍然等于「这个会话从未归档」。
 
 - **digest 是纯代码抽取的事实清单**（意图原文 / 文件读写次数 / 报错行 / 待办 / 重复调用），不调用
-  模型、逐字节可复现；体积默认 ≤800 tokens，而一个真实 raw 归档约 30 KB ≈ 8k tokens —— 直接回读
-  raw 几乎会抵掉压缩省下的量，所以让 agent 先读 digest。
+  模型、逐字节可复现；体积默认 ≤800 tokens。**digest 才是「0 token 摘要」**：raw 只是同一区间的
+  逐字重录（不是摘要），所以默认不写。
 - **跨次继承**：新 digest 继承上一次的意图/概念/文件/报错小节，避免第二段压缩丢掉更早的历史
   （「摘要的摘要」）。绝不跨会话继承，版本不符则放弃继承。
 - **进入上下文的只有短帧**，不是 digest 正文：接管模式下，帧给路径 + 读取规则（`regionTokens ≥ 600`
@@ -79,7 +86,7 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
   1. **写盘是同步堵塞的**：`session/event` 是 cordis 的 `emit`（同步分发、**不等待**监听器返回值），
      `compaction/summary` 之后**紧接**（中间无 `await`）就是区间替换 —— 监听器唯一能保证「先落盘」
      的手段就是在这轮同步调用里把文件写完。所以归档用的是同步 I/O：`append('compaction/summary')`
-     返回时 `epoch-N.raw.md` / `epoch-N.digest.md` 已经在盘上，**严格早于**替换消息生效。
+     返回时 `epoch-N.digest.md`（以及开启时的 `epoch-N.raw.md`）已经在盘上，**严格早于**替换消息生效。
      代价：调用方每次压缩多等几毫秒；归档盘卡住会拖住压缩调用方。写盘一律 tmp + `rename`，
      不会留半截文件。（对比 0.3.5：那时是 fire-and-forget，落盘只是**通常**早于替换。）
   2. 路径只能靠**续跑提示**进上下文：checkpoint 是别人的摘要，不会带我们的路径。关掉
@@ -93,7 +100,7 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
 
 | 级别 | 触发 | 文本 |
 |---|---|---|
-| `L0` | 窗口内 ≤1 次（或关闭分级） | 基础模板（含 digest/raw 路径） |
+| `L0` | 窗口内 ≤1 次（或关闭分级） | 基础模板（含摘要路径，及开启时的 raw 路径） |
 | `L1` | 窗口内 =2 次 | 追加「改为增量推进：只读确需片段、结论写进 todo_write」 |
 | `L2` | 窗口内 ≥3 次 | 追加「先拆分再继续」：会话**确实**带 `subagent`/`subagent_fork`/`workflow`/`ralph` 时点名委派，否则给「按需取片」方案 |
 | `L3` | 窗口内 ≥`resumeMaxPerWindow`（默认 5） | **不唤醒**：只留一条 `next-turn` 提示（「本次不再自动续跑」），归档与摘要照常落盘 |
@@ -126,7 +133,7 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
   `compaction-basic` 放在 `isolate: { compaction: true }` 后面，host 光纤看不到，只能走 seam）。
   两层都没有时插件照常加载，hook 1 可用，hook 2/3 降级并记录一次警告，**不会 pending、不会阻塞启动**。
 - 越界配置（如 `thresholdRatio: 2`）不抛错：记录 `error` 日志并回退 0.85。
-- 归档写盘失败只 `warn` 不抛：帧降级为「无路径」或「只有 raw」，压缩本身照常成功。
+- 归档写盘失败只 `warn` 不抛：帧降级为「无路径」或「只有 digest」，压缩本身照常成功。
 - **续跑提示里的归档路径只在真有时才写**，两个来源按可信度排序：
   1. **守卫自己的记录** —— 旁挂归档写完时按 `compactionId → {rawPath, digestPath}` 记下（写盘同步
      完成，所以记录里就是落盘结果本身）。这是 `compaction-basic` 会话唯一可用的来源，因为它的
@@ -165,7 +172,8 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `digestTargetRatio` | number (0.05–0.95) | `0.45` | 预算 = `min(上限, 区间 tokens × 比例)` |
 | `digestCarryForward` | boolean | `true` | 继承上一次摘要的有效小节 |
 | `digestTokenEstimator` | `cjk` \| `ascii` | `cjk` | 计价方式；`cjk` 中文按 ~2 字/token |
-| `rawExcludeInjected` | boolean | `false` | 无损归档中也剔除宿主重发的注入内容 |
+| `writeRawArchive` | boolean | `false` | 是否另写 `epoch-N.raw.md` 全文归档（**默认关闭**，只留 digest） |
+| `rawExcludeInjected` | boolean | `false` | 开启 `writeRawArchive` 时，归档中也剔除宿主重发的注入内容 |
 | `archiveLayout` | `session` \| `flat` | `session` | `flat` 为旧行为（平铺，无会话隔离） |
 
 > 引擎行上这几个键是**中间优先层**：settings 用户层 > 引擎行 config > 内置默认。引擎行是否显式写了
@@ -194,7 +202,8 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `digestTargetRatio` | `0.45` | 预算比例 |
 | `digestCarryForward` | `true` | 跨次继承 |
 | `digestTokenEstimator` | `cjk` | 计价方式 |
-| `rawExcludeInjected` | `false` | 归档剔除注入内容 |
+| `writeRawArchive` | `false` | 另写 `epoch-N.raw.md` 全文归档（默认关闭） |
+| `rawExcludeInjected` | `false` | 归档剔除注入内容（仅在开启 `writeRawArchive` 时有意义） |
 | `archiveLayout` | `session` | 归档布局 |
 | `resumeEscalation` | `true` | 按压缩频率分级 |
 | `resumeWindowMinutes` | `30` | 统计窗口 |
@@ -210,10 +219,11 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 续跑模板占位符：`{{epoch}}` `{{window}}` `{{compactions}}` `{{archive}}` `{{digest}}` `{{raw}}`
 `{{intent}}`；收尾模板占位符：`{{todos}}` `{{notePath}}` `{{epoch}}`。未知占位符原样保留。
 
-- `{{archive}}` 是**交接文档声明块**：有归档时给出 digest/raw 的绝对路径并说明「不要求通读，但请
-  知道它在那里，需要时可直接 read」，没有归档时如实说明本次没有归档文档。它只在守卫确认文件存在
-  之后才给出路径。想让续跑提示更短，可以在自己的模板里删掉 `{{archive}}`；想保留路径但不要声明
-  文案，则用 `{{digest}}`/`{{raw}}`（缺失时渲染成「（本次未生成摘要文件）」/「（本次未生成归档文件）」）。
+- `{{archive}}` 是**交接文档声明块**：有归档时给出摘要路径（开启全文归档时再加 raw 路径）并说明
+  「不要求通读，但请知道它在那里，需要时可直接 read」，没有归档时如实说明本次没有归档文档。它只在
+  守卫确认文件存在之后才给出路径。想让续跑提示更短，可以在自己的模板里删掉 `{{archive}}`；想保留
+  路径但不要声明文案，则用 `{{digest}}`/`{{raw}}`（缺失时渲染成「（本次未生成摘要文件）」/
+  「（本次未生成归档文件）」）。
 
 阈值判定优先级：`供应商阈值 > 默认阈值 > 组合配置的 thresholdRatio × contextWindow`。
 
@@ -251,8 +261,9 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
 | `context-guard/resume: sent agent=… compaction=… inWindow=… level=… digest=… promptTokens=…` | info | 续跑已注入并唤醒 |
 | `context-guard/resume: suppressed agent=… compaction=… inWindow=… window=…` | warn | L3：不唤醒，只留提示 |
 | `context-guard/resume: failed agent=… error=…` | warn | 续跑渲染/注入异常 |
-| `context-guard/digest: knobs source=settings\|config\|default enabled=… maxTokens=… targetRatio=… carryForward=… estimator=… rawExcludeInjected=… layout=…` | info | 生效配置**变化时**记一次（含来源） |
-| `context-guard/digest: raw-written epoch=… session=… layout=… messages=… dir=… file=…` | info | 无损归档已落盘 |
+| `context-guard/digest: knobs source=settings\|config\|default enabled=… maxTokens=… targetRatio=… carryForward=… estimator=… writeRaw=… rawExcludeInjected=… layout=…` | info | 生效配置**变化时**记一次（含来源） |
+| `context-guard/digest: raw-written epoch=… session=… layout=… messages=… dir=… file=…` | info | 全文归档已落盘（仅在 `writeRawArchive` 开启时出现） |
+| `context-guard/digest: raw-skipped epoch=… session=… reason=disabled` | info | 全文归档按配置跳过（默认行为） |
 | `context-guard/digest: written epoch=… session=… region=N/M tokens=…→… budget=… tier=… carriedFrom=… digest=… raw=…` | info | 摘要已落盘（`tier` 见格式契约 §5） |
 | `context-guard/digest: skipped reason=disabled session=…` | info | 摘要被关闭 |
 | `context-guard/digest: no-base-dir session=…` | warn | 会话无 `cwd` 且引擎未配 `archiveDir` |
@@ -274,7 +285,8 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
 - **L3 只排队不唤醒**：用 `agent.send(msg, 'next-turn', false)` 而非 `followup()`，避免在被抑制时仍把
   agent 拉起来。
 - **并发安全**：`compacting` 标记防止同一会话的并发压缩；压缩信号在插件卸载时中止。
-- **写盘原子性**：tmp + `rename`；顺序 raw → `latest.txt` → digest → `latest-digest.txt`，指针最后移动。
+- **写盘原子性**：tmp + `rename`；顺序（开启 raw 时）raw → `latest.txt` → digest → `latest-digest.txt`，
+  指针最后移动；默认只走 digest → `latest-digest.txt` 两步。
 - **旁挂序号与收尾笔记同源**：`N = ` 本会话（含手动）压缩总数 `+ 1`。写盘时 `compaction/end` 还没追加，
   所以这个数与收尾提示里的 `{{epoch}}`、以及盘上已有的最大编号（取较大者）一致，不会重号。
 
@@ -302,8 +314,8 @@ npm run verify      # 三者全跑
 
 测试套件（`tests/`）通过真实 agent loop 驱动脚本化 mock adapter，覆盖完整闭环（提醒 → 收尾 → 空闲
 压缩 → 续跑）、阈值以下无动作、已收尾步骤不提醒、失败压缩不续跑、每个配置开关、每周期一次防循环
-语义、**旁挂归档**（外来后端写 raw+digest 并被续跑提示引用、跨次编号与继承、自家引擎不重复写、
-**替换消息派发那一刻归档已在盘上**），
+语义、**旁挂归档**（外来后端写 digest、开启时另加 raw，并被续跑提示引用、跨次编号与继承、
+自家引擎不重复写、**默认只写 digest 而序号仍连续**、**替换消息派发那一刻归档已在盘上**），
 以及新增模块的纯函数契约：摘要抽取/预算梯度/继承与版本失配（`digest.spec.ts`）、落点与目录名
 清洗（`paths.spec.ts`）、分级续跑决策与 `{{archive}}` 声明块（`resume-prompt.spec.ts`）、会话事实读取
 （`session-facts.spec.ts`）、设置解析与优先级（`settings.spec.ts`）、共用写盘器与 `minEpoch` 编号

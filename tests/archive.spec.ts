@@ -61,7 +61,7 @@ describe('writeArchive', () => {
       epochPrefix: 'epoch',
       sessionId: 'a1',
       messages: [message('修复登录 bug'), message('继续')],
-      config: resolveDigestConfig(undefined),
+      config: resolveDigestConfig(undefined, { writeRaw: true }),
       log,
       logScope: 'sidecar',
     })
@@ -93,7 +93,7 @@ describe('writeArchive', () => {
       epochPrefix: 'epoch',
       sessionId: 'a1',
       messages: [message('first')],
-      config: resolveDigestConfig(undefined),
+      config: resolveDigestConfig(undefined, { writeRaw: true }),
       log,
       logScope: 'sidecar',
     }
@@ -119,7 +119,7 @@ describe('writeArchive', () => {
       epochPrefix: 'epoch',
       sessionId: 'a1',
       messages: [message('body')],
-      config: resolveDigestConfig({ digestEnabled: false }),
+      config: resolveDigestConfig({ digestEnabled: false }, { writeRaw: true }),
       log,
       logScope: 'sidecar',
     })
@@ -148,6 +148,8 @@ describe('writeArchive', () => {
     const base = await makeTmpDir()
     const { log, lines } = captureLog()
     // A regular file where the session directory must go: mkdir fails.
+    // The first call below writes the digest (the raw is opt-in), so that is the
+    // file to aim the second call at.
     await writeArchive({
       base,
       layout: 'flat',
@@ -159,7 +161,7 @@ describe('writeArchive', () => {
       logScope: 'sidecar',
     })
     const artifacts = await writeArchive({
-      base: path.join(base, 'epoch-1.raw.md'),
+      base: path.join(base, 'epoch-1.digest.md'),
       layout: 'flat',
       epochPrefix: 'epoch',
       sessionId: 'a1',
@@ -170,6 +172,95 @@ describe('writeArchive', () => {
     })
     expect(artifacts.digestPath).toBeUndefined()
     expect(lines.some(line => line.includes('write-failed'))).toBe(true)
+  })
+})
+
+/**
+ * The side-car exists to hand over a **0-token digest** — a document small
+ * enough to read at resume time. The raw transcript is the whole compacted
+ * region re-dumped (measured: 401 messages → 286 KB ≈ 64k tokens, 65.6% of it
+ * tool results), so it is opt-in: writing ~300 KB per compaction that nobody
+ * reads is not the default. These tests pin both sides of that switch.
+ */
+describe('raw transcript is opt-in', () => {
+  it('writes only the digest by default', async () => {
+    const base = await makeTmpDir()
+    const { log, lines } = captureLog()
+    const artifacts = await writeArchive({
+      base,
+      layout: 'session',
+      epochPrefix: 'epoch',
+      sessionId: 'a1',
+      messages: [message('修复登录 bug')],
+      config: resolveDigestConfig(undefined),
+      log,
+      logScope: 'sidecar',
+    })
+    const dir = path.join(base, 'sessions', 'a1')
+    expect((await readdir(dir)).sort()).toEqual(['epoch-1.digest.md', LATEST_DIGEST_POINTER])
+    expect(artifacts.rawPath).toBeUndefined()
+    expect(artifacts.rawBytes).toBeUndefined()
+    expect(artifacts.digestPath).toBe(path.join(dir, 'epoch-1.digest.md'))
+    expect(lines.some(line => line.includes('raw-skipped'))).toBe(true)
+    // The digest no longer advertises a transcript that was never written.
+    const digest = await readFile(artifacts.digestPath as string, 'utf8')
+    expect(digest).not.toContain('原始档')
+    expect(digest).not.toContain('未落盘')
+  })
+
+  it('still numbers epochs from the digests alone', async () => {
+    const base = await makeTmpDir()
+    const { log } = captureLog()
+    const config = resolveDigestConfig(undefined)
+    const numbers: (number | undefined)[] = []
+    for (let index = 0; index < 3; index += 1) {
+      const artifacts = await writeArchive({
+        base,
+        layout: 'session',
+        epochPrefix: 'epoch',
+        sessionId: 'a1',
+        messages: [message(`第 ${index} 段`)],
+        config,
+        log,
+        logScope: 'sidecar',
+      })
+      numbers.push(artifacts.epoch)
+    }
+    // Numbering used to be scanned from `*.raw.md`, so with no raws every
+    // compaction would have claimed epoch 1 and overwritten the previous digest.
+    expect(numbers).toEqual([1, 2, 3])
+    const dir = path.join(base, 'sessions', 'a1')
+    expect((await readdir(dir)).sort()).toEqual([
+      'epoch-1.digest.md',
+      'epoch-2.digest.md',
+      'epoch-3.digest.md',
+      LATEST_DIGEST_POINTER,
+    ])
+  })
+
+  it('writes the transcript when the setting asks for it', async () => {
+    const base = await makeTmpDir()
+    const { log } = captureLog()
+    const artifacts = await writeArchive({
+      base,
+      layout: 'session',
+      epochPrefix: 'epoch',
+      sessionId: 'a1',
+      messages: [message('body')],
+      config: resolveDigestConfig({ writeRawArchive: true }),
+      log,
+      logScope: 'sidecar',
+    })
+    const dir = path.join(base, 'sessions', 'a1')
+    expect((await readdir(dir)).sort()).toEqual([
+      'epoch-1.digest.md',
+      'epoch-1.raw.md',
+      LATEST_DIGEST_POINTER,
+      LATEST_POINTER,
+    ])
+    expect(artifacts.rawBytes).toBeGreaterThan(0)
+    const digest = await readFile(artifacts.digestPath as string, 'utf8')
+    expect(digest).toContain('原始档')
   })
 })
 
@@ -191,7 +282,7 @@ describe('archive text hygiene', () => {
       epochPrefix: 'epoch',
       sessionId: 'a1',
       messages: [message('before\u0000after'), message('tail')],
-      config: resolveDigestConfig(undefined),
+      config: resolveDigestConfig(undefined, { writeRaw: true }),
       log,
       logScope: 'sidecar',
     })
@@ -211,7 +302,7 @@ describe('archive text hygiene', () => {
       epochPrefix: 'epoch',
       sessionId: 'a1',
       messages: [message('\u001b[1;34m==> checking\u001b[0m done')],
-      config: resolveDigestConfig(undefined),
+      config: resolveDigestConfig(undefined, { writeRaw: true }),
       log,
       logScope: 'sidecar',
     })

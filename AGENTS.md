@@ -15,14 +15,14 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
    `agent.followup()`；L3 只 `agent.send(..., 'next-turn', false)` 排队不唤醒。
 4. `compaction/summary`（**旁挂归档**）：压缩由别的引擎执行（`provider !== 'context-guard'`，即
    `standard` preset 的 `compaction-basic` 或手动 `/compact`）时，守卫按 `shadowedSeqs` 取回区间，
-   自己写 `raw` + `digest`。**不接管 dsh 的压缩执行** —— 不覆写 `summarize()`、不改替换消息，
-   模型看到的 checkpoint 始终是原压缩机产出的。
+   自己写 `digest`（`raw` 全文归档默认关闭，见「关键约定」）。**不接管 dsh 的压缩执行** —— 不覆写
+   `summarize()`、不改替换消息，模型看到的 checkpoint 始终是原压缩机产出的。
 
 - 阈值优先级：settings 供应商绝对阈值 > settings 默认绝对阈值 > `thresholdRatio × contextWindow`。
 - 续跑分级：窗口内自动压缩 2 次→L1（增量推进）、≥3 次→L2（拆分/委派，仅在请求头确实带委派工具时
   点名）、≥`resumeMaxPerWindow`→L3 不唤醒（与分级开关无关，始终生效）。只统计自动压缩
   （`sourceCommandId === undefined`），窗口内出现新的人类消息重置计数。
-- Web 设置分节「上下文守卫」三组共 14 项写入 `context-guard` settings 命名空间，host 实时 `watch`，
+- Web 设置分节「上下文守卫」三组共 15 项写入 `context-guard` settings 命名空间，host 实时 `watch`，
   保存即生效（稀疏 patch；提示词留空 = 关闭该注入）。
 
 ## 形态与入口
@@ -50,7 +50,7 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
 | 路径 | 职责 |
 |---|---|
 | `src/index.ts` | Host 插件：`apply()`、Config schema、四个事件触发、settings 注册、每会话 EpisodeState、分级续跑、**旁挂归档**（`compaction/summary` → `writeArchive`，按 `compactionId` 记路径） |
-| `src/archive.ts` | **共用写盘器** `writeArchive()`：raw + digest + `latest*` 指针、跨次继承、`minEpoch` 序号；失败只 warn 不抛；不 import 压缩后端（host 半边可安全使用） |
+| `src/archive.ts` | **共用写盘器** `writeArchive()`：digest + `latest-digest.txt`（`raw` + `latest.txt` 仅在 `writeRawArchive` 开启时写）、跨次继承、`minEpoch` 序号；`nextEpoch` 同时扫 `*.digest.md`（否则关了 raw 序号会重来）；失败只 warn 不抛；不 import 压缩后端（host 半边可安全使用） |
 | `src/compaction.ts` | `ArchiveCutEngine`：覆写 `summarize()`，委托 `writeArchive` 并渲染指针帧 |
 | `src/digest.ts` | 确定性事实抽取与 digest 渲染（`extractFacts`/`composeDigest`/`parseDigest`/`carriedFrom`） |
 | `src/paths.ts` | 落点计算：`sessionDirName`/`archiveLocation`/`digestPointerCandidates` |
@@ -89,6 +89,12 @@ npm run verify      # typecheck && test && build（顺序固定）
   发版即 `npm run verify && npm publish`。
 - **构建顺序固定**：`tsdown`（`clean: true` 会清空 `lib/`）→ `scripts/build.mjs`。
 - **归档落点**：`<archiveDir 或 cwd>/.handoff/sessions/<完整会话id>/`；写失败仅 warn 不抛。
+- **全文归档按需开启（0.4.0 起 `writeRawArchive`，默认 false）**：默认只写 `epoch-<N>.digest.md`
+  与 `latest-digest.txt`；`epoch-<N>.raw.md` 与 `latest.txt` 仅在显式开启时落盘（跳过时记
+  `raw-skipped`）。理由是 raw 就是被裁区间的逐字重录，实测一段 401 消息的区间 ≈286 KB / ≈64k tokens，
+  与被压缩掉的体量同量级，留着等于一份随时会被整份读回来的第二份上下文。**改 `nextEpoch` 前先看
+  `src/archive.ts`**：它的编号正则必须同时覆盖 `*.raw.md` 与 `*.digest.md`，只扫 raw 会在关闭时
+  让序号每次从 1 重来并覆盖上一份摘要。
 - **归档必须无 NUL**（0.3.7 起）：所有归档写盘都经 `writeAtomic` → `sanitizeDocText()`，剥 ANSI、CR→LF、
   NUL→`␀`、丢其余 C0/DEL。原因是**一个 NUL 就让 Web 文档预览拒开整份文件**（`workspace-file/not-text`
   →「非文本文件，暂时无法预览。」），而工具结果里带 NUL 是常态（`/proc/<pid>/cmdline` 用 NUL 分隔）。

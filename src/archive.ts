@@ -144,10 +144,16 @@ function messageText(message: Message): string {
     .join('\n')
 }
 
-/** Next unused epoch in one directory: one past the highest raw archive present. */
+/**
+ * Next unused epoch in one directory: one past the highest archive present.
+ *
+ * Both artefacts count, because the raw archive is optional (off by default):
+ * scanning only `*.raw.md` would restart the numbering at 1 for every
+ * compaction once nothing writes raws, reusing `epoch-1` forever.
+ */
 function nextEpoch(dir: string, epochPrefix: string): number {
   let max = 0
-  const pattern = new RegExp(`^${escapeRegExp(epochPrefix)}-(\\d+)\\.raw\\.md$`)
+  const pattern = new RegExp(`^${escapeRegExp(epochPrefix)}-(\\d+)\\.(?:raw|digest)\\.md$`)
   try {
     for (const name of readdirSync(dir)) {
       const match = pattern.exec(name)
@@ -188,7 +194,21 @@ export function writeArchive(request: ArchiveRequest): Artifacts {
   const artifacts: Artifacts = { regionTokens }
   try {
     mkdirSync(location.dir, { recursive: true })
-    writeRaw(location, messages, config, artifacts, log, logScope, epochPrefix, minEpoch)
+    // The raw transcript is opt-in: the side-car's job is the **0-token digest**,
+    // and re-dumping the whole region (≈64k tokens for a 401-message span, 65.6%
+    // of it tool results) is not something anyone reads at handoff time. The epoch
+    // is still allocated here, because `writeDigest` numbers itself from it.
+    if (config.writeRaw) {
+      writeRaw(location, messages, config, artifacts, log, logScope, epochPrefix, minEpoch)
+    } else {
+      const scanned = nextEpoch(location.dir, epochPrefix)
+      artifacts.epoch = minEpoch === undefined ? scanned : Math.max(scanned, minEpoch)
+      logInfo(log, logScope, 'raw-skipped', {
+        epoch: artifacts.epoch,
+        session: location.session.length > 0 ? location.session : '(flat)',
+        reason: 'disabled',
+      })
+    }
     if (!config.enabled) {
       logInfo(log, logScope, 'skipped', { reason: 'disabled', session: sessionId })
       return artifacts

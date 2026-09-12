@@ -54,7 +54,7 @@ window.__ModuleLoader__.load({
 
       // 接力摘要
       digestTitle: '接力摘要',
-      digestHint: '压缩时把被裁区间确定性抽取成一份精简事实摘要（零模型调用），落盘为 epoch-<N>.digest.md；续跑提示会让 agent 先读它、需要细节再读完整归档。',
+      digestHint: '压缩时把被裁区间确定性抽取成一份精简事实摘要（零模型调用），落盘为 epoch-<N>.digest.md；续跑提示会让 agent 先读它，需要细节再去会话日志里检索。',
       digestEnabled: '生成摘要文档',
       digestMaxTokens: '摘要上限（tokens）',
       digestMaxTokensHint: '摘要正文字数上限，默认 800。数值越大信息越多、回读越贵。',
@@ -66,6 +66,8 @@ window.__ModuleLoader__.load({
       digestEstimatorHint: 'cjk：中文按 ~2 字/token 计价（更接近真实）；ascii：与宿主一致按 4 字符/token。',
       rawExcludeInjected: '归档中剔除宿主重发注入',
       rawExcludeInjectedHint: '剔除系统提示/AGENTS.md/skill 目录等每轮重发的内容。默认关闭（归档保持无损）。',
+      writeRawArchive: '写完整原文归档',
+      writeRawArchiveHint: '把被裁区间逐字另存为 epoch-<N>.raw.md。默认关闭：这份原文重录的体量与被压缩掉的上下文相当（实测一段 401 消息的区间 ≈286 KB / ≈106k tokens），整份读回等于把刚腾出的空间又填满；要细节请改从会话日志检索。',
       archiveLayout: '归档布局',
       archiveLayoutHint: 'session：按会话分目录（sessions/<会话id>/，推荐）；flat：全部平铺在 .handoff/ 根下（旧行为）。',
 
@@ -219,6 +221,7 @@ window.__ModuleLoader__.load({
         carryForward: true,
         estimator: 'cjk',
         rawExcludeInjected: false,
+        writeRawArchive: false,
         layout: 'session',
       })
       const [resume, setResume] = useState({
@@ -266,6 +269,7 @@ window.__ModuleLoader__.load({
             carryForward: value.digestCarryForward !== false,
             estimator: value.digestTokenEstimator === 'ascii' ? 'ascii' : 'cjk',
             rawExcludeInjected: value.rawExcludeInjected === true,
+            writeRawArchive: value.writeRawArchive === true,
             layout: value.archiveLayout === 'flat' ? 'flat' : 'session',
           })
           setResume({
@@ -303,6 +307,7 @@ window.__ModuleLoader__.load({
           digestCarryForward: digest.carryForward,
           digestTokenEstimator: digest.estimator,
           rawExcludeInjected: digest.rawExcludeInjected,
+          writeRawArchive: digest.writeRawArchive,
           archiveLayout: digest.layout,
           resumeEscalation: resume.escalation,
           resumeWindowMinutes: numberOr(resume.windowMinutes, 30),
@@ -422,6 +427,8 @@ window.__ModuleLoader__.load({
               { value: 'flat', label: 'flat（平铺，旧行为）' },
             ], value => setDigest({ ...digest, layout: value })),
           ),
+          checkRow(T.writeRawArchive, T.writeRawArchiveHint, digest.writeRawArchive,
+            value => setDigest({ ...digest, writeRawArchive: value })),
           checkRow(T.rawExcludeInjected, T.rawExcludeInjectedHint, digest.rawExcludeInjected,
             value => setDigest({ ...digest, rawExcludeInjected: value })),
         ),
