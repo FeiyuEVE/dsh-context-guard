@@ -101,3 +101,23 @@ export function digestPointerCandidates(base: string, sessionId: string): string
     path.join(base, LATEST_DIGEST_POINTER),
   ]
 }
+
+/** Suffix of the wrap-up handoff note that belongs to one epoch. */
+export const HANDOFF_NOTE_SUFFIX = '.handoff.md'
+
+/**
+ * Path of the wrap-up handoff note for one compaction, beside that epoch's
+ * `raw`/`digest` pair.
+ *
+ * The note is written by the agent (the wrap-up prompt names this path), not by
+ * the engine, but it belongs in the same directory: one session's artifacts
+ * stay together, and the epoch prefix makes the note sort with the cut it
+ * describes. The prefix is fixed rather than the engine's `epochPrefix` because
+ * the guard does not read the engine row's config.
+ *
+ * @param dir - the session's archive directory ({@link ArchiveLocation.dir}).
+ * @param epoch - this session's compaction number the note describes (1-based).
+ */
+export function handoffNotePath(dir: string, epoch: number): string {
+  return path.join(dir, `epoch-${epoch}${HANDOFF_NOTE_SUFFIX}`)
+}

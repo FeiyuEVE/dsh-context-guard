@@ -44,9 +44,15 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
 <cwd>/.handoff/sessions/<会话id>/
   epoch-N.raw.md          无损全文归档（细节按需 read）
   epoch-N.digest.md       确定性事实摘要（续跑后第一份要读的文档）
+  epoch-N.handoff.md      收尾接力笔记（**由 agent 按收尾提示词写**，不是引擎产物）
   latest.txt              → 最新 raw 的绝对路径
   latest-digest.txt       → 最新 digest 的绝对路径
 ```
+
+- **接力笔记也按会话分目录**：收尾提示词里的 `{{notePath}}` 由守卫算出（`epoch-N.handoff.md`，
+  `N` = 本会话第几次压缩，即将发生的那次），并要求文件**首行标题**写成
+  `# 第 N 次压缩 · 接力笔记 · <主题>`。守卫只算路径、不写文件（`write` 工具会自建父目录），
+  所以「`.handoff/sessions/` 不存在」仍然等于「这个会话从未归档」。
 
 - **digest 是纯代码抽取的事实清单**（意图原文 / 文件读写次数 / 报错行 / 待办 / 重复调用），不调用
   模型、逐字节可复现；体积默认 ≤800 tokens，而一个真实 raw 归档约 30 KB ≈ 8k tokens —— 直接回读
@@ -164,7 +170,7 @@ profile 的压缩后端配置。要用确定性归档后端，在 preset 的 `co
 | `resumeWindowMinutes` | `30` | 统计窗口 |
 | `resumeMaxPerWindow` | `5` | 窗口内自动压缩上限（达到即 L3 不唤醒） |
 | `resumePromptTemplate` | `''` | 续跑提示词；**清空 = 关闭该注入** |
-| `wrapUpPromptTemplate` | `''` | 收尾提示词；**清空 = 关闭该注入** |
+| `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入** |
 
 > 组合层（`cordis.patch.yml` 的 `wrapUpPrompt`/`resumePrompt`）在注册时即写入 settings 的 **base 层**，
 > 所以面板读到的就是「当前生效文本」。解析结果（**含空字符串**）是权威值：清空字段并保存即可关掉对应
@@ -270,6 +276,10 @@ npm run verify      # 三者全跑
 - 收尾是「提示性停止」：通过提醒引导 agent 自行收尾停轮，不强制中断轮次。
 - digest 是**事实清单而非语义摘要**：它不试图理解内容，模型需要推理脉络时仍要 `read` 完整归档。
 - `.handoff/` 根下 299 份历史 flat 归档**不迁移**（无法按会话归属），新版不再写根 `latest.txt`。
+  旧的收尾笔记（`<日期>-<主题>.md`）也留在根下不动：**0.3.4 起新笔记写进 `sessions/<会话id>/`**，
+  根目录不再增长。
+- 接力笔记的目录由守卫按 `<cwd>/.handoff` 默认基线 + settings 的 `archiveLayout` 算出；
+  若压缩引擎行单独配了别的 `archiveDir`（不在 settings 命名空间里），笔记与归档会分处两地。
 - digest 含用户文本与路径：父仓库 `.gitignore` 已 ignore `.handoff/sessions/`。
 - 同一会话的并发压缩靠 guard 的 `compacting` 标记串行化；跨进程并发写同一会话仍未加文件锁。
 

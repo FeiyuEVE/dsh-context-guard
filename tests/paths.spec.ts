@@ -6,7 +6,7 @@
 
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { SESSIONS_DIRNAME, archiveLocation, digestPointerCandidates, sessionDirName } from '../src/paths.ts'
+import { SESSIONS_DIRNAME, archiveLocation, digestPointerCandidates, handoffNotePath, sessionDirName } from '../src/paths.ts'
 
 describe('sessionDirName', () => {
   it('keeps an ordinary id verbatim', () => {
@@ -65,5 +65,16 @@ describe('digestPointerCandidates', () => {
       path.join('/w/.handoff', SESSIONS_DIRNAME, 'a1', 'latest-digest.txt'),
       path.join('/w/.handoff', 'latest-digest.txt'),
     ])
+  })
+})
+
+describe('handoffNotePath', () => {
+  it('sits beside the epoch it belongs to, under the session directory', () => {
+    const dir = archiveLocation('/w/.handoff', 'a1', 'session').dir
+    expect(handoffNotePath(dir, 3))
+      .toBe('/w/.handoff/sessions/a1/epoch-3.handoff.md')
+    // Distinct from the engine's own artifacts of the same epoch.
+    expect(handoffNotePath(dir, 3).endsWith('.handoff.md')).toBe(true)
+    expect(handoffNotePath(dir, 3)).not.toBe(path.join(dir, 'epoch-3.digest.md'))
   })
 })

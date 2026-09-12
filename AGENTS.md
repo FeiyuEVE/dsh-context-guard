@@ -78,6 +78,10 @@ npm run verify      # typecheck && test && build（顺序固定）
   发版即 `npm run verify && npm publish`。
 - **构建顺序固定**：`tsdown`（`clean: true` 会清空 `lib/`）→ `scripts/build.mjs`。
 - **归档落点**：`<archiveDir 或 cwd>/.handoff/sessions/<完整会话id>/`；写失败仅 warn 不抛。
+- **接力笔记同落点**：收尾提示词的 `{{notePath}}` = 该会话目录下的 `epoch-<即将这次序号>.handoff.md`
+  （序号 = 本会话压缩总数 + 1，与续跑提示 `{{epoch}}` 同一事实源），标题要求
+  `# 第 N 次压缩 · 接力笔记 · <主题>`；守卫只算路径、不建目录（`write` 工具自建父目录），
+  所以空目录仍等于「从未归档」。
 - **续跑提示里的路径必须为真**：只从本引擎的指针帧取（帧首 `FRAME_MARKER` 标记归属，外域摘要一律不认）、
   只收绝对路径、取到后落盘确认；否则模板渲染成「本次未生成摘要文件 / 归档文件」。
 - **日志一律走 `createLogSink`**（`ctx.logger` + console 双投递），字段不含正文。

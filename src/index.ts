@@ -50,7 +50,7 @@ import type {} from '@deepseek-ai/dsh-token-meter'
 import type {} from '@deepseek-ai/dsh-settings'
 import { DIGEST_FORMAT_VERSION, FRAME_MARKER, digestPathFrom, estimateTextTokens } from './digest.ts'
 import { createLogSink, logInfo, logWarn } from './log.ts'
-import { digestPointerCandidates } from './paths.ts'
+import { archiveLocation, digestPointerCandidates, handoffNotePath } from './paths.ts'
 import {
   DEFAULT_RESUME_PROMPT,
   DEFAULT_WRAP_UP_PROMPT,
@@ -352,8 +352,16 @@ export function apply(ctx: Context, config: Config = {}): void {
     const template = pickTemplate(settings().wrapUpPromptTemplate, wrapUpPrompt, DEFAULT_WRAP_UP_PROMPT)
     if (state.warned || template.length === 0) return
     if (!stepOwesMoreWork(agent.session, turn, step)) return
+    const note = handoffNote(agent)
     state.pendingReminder = createUserMessage({
-      content: [{ type: 'text', text: buildWrapUpPrompt(template, pendingTodos(agent.session)) }],
+      content: [{
+        type: 'text',
+        text: buildWrapUpPrompt(template, {
+          todos: pendingTodos(agent.session),
+          epoch: note.epoch,
+          notePath: note.path,
+        }),
+      }],
       source: pluginSource(WRAP_UP_SUMMARY),
     })
     state.warned = true
@@ -390,6 +398,35 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
     }
     return undefined
+  }
+
+  /**
+   * This session's artifact directory: the same resolved base and layout the
+   * engine archives into, since both read the same settings layer.
+   */
+  function sessionArchiveDir(agent: Agent): string {
+    const cwd = agent.session.header?.cwd
+    const base = cwd !== undefined && cwd.length > 0 ? path.join(cwd, '.handoff') : '.handoff'
+    return archiveLocation(base, String(agent.session.id), settings().archiveLayout).dir
+  }
+
+  /**
+   * This session's wrap-up note: the path the reminder tells the agent to write,
+   * plus the compaction number both that path and the note title carry.
+   *
+   * The number is the *coming* compaction's — the note is written just before
+   * the cut it hands off from — counted the way the continuation prompt counts
+   * them: every compaction of this session, automatic or manual.
+   *
+   * The directory is deliberately not created here: the `write` tool creates
+   * parent directories, and creating it eagerly would leave empty session
+   * directories behind for sessions that never archive (that emptiness is also
+   * how "this session archived nothing" is recognized on disk).
+   */
+  function handoffNote(agent: Agent): { epoch: number; path: string; dir: string } {
+    const dir = sessionArchiveDir(agent)
+    const epoch = compactionPace(agent.session, Date.now(), settings().resumeWindowMinutes).sessionTotal + 1
+    return { epoch, path: handoffNotePath(dir, epoch), dir: `${dir}/` }
   }
 
   ctx.on('session/event', (session, event) => {
@@ -450,6 +487,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         rawPath,
         todos: pendingTodos(agent.session),
         intent: lastHumanIntent(agent.session),
+        noteDir: `${sessionArchiveDir(agent)}/`,
         delegationTools: delegation,
       }, { escalation: resolved.resumeEscalation })
       const promptTokens = estimateTextTokens(decision.prompt, resolved.digestTokenEstimator)

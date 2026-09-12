@@ -18,8 +18,9 @@
 /** Default wrap-up reminder: finish, externalize state, hand off, stop. */
 export const DEFAULT_WRAP_UP_PROMPT =
   '当前会话上下文已接近上限，即将被截断为「本回复 + 归档指针」。请立即收尾：\n'
-  + '1) 若任务尚未完成，把关键状态写入工作区 .handoff/ 目录下的一个 md 文件'
-  + '（涉及的文件路径、已做决策、未完成项、下一步），文件名自定，并在下面的接力总结中给出该路径；\n'
+  + '1) 若任务尚未完成，把关键状态写入 `{{notePath}}`；该文件**第一行标题**必须是 '
+  + '`# 第 {{epoch}} 次压缩 · 接力笔记 · <一句话主题>`（本会话第 {{epoch}} 次压缩），'
+  + '正文写涉及的文件路径、已做决策、未完成项、下一步，并在下面的接力总结中给出该路径；\n'
   + '2) 用 todo_write 把未完成项写成待办清单（它会被自动摘要带进下一段上下文）；\n'
   + '3) 在回复末尾输出一段 ≤200 字、自包含的接力总结（截断后它将是上下文里唯一的对话帧）；\n'
   + '4) 不要启动新的子任务或继续深入探索，完成后停止。'
@@ -52,8 +53,20 @@ export interface ResumeFacts {
   todos: string[]
   /** Last direct human request, clipped. */
   intent?: string | undefined
+  /** This session's archive directory, so an L2 stop-note lands there too. */
+  noteDir?: string | undefined
   /** Delegation-capable tool names present in the session's request header. */
   delegationTools: string[]
+}
+
+/** Measured facts one wrap-up reminder is rendered from. */
+export interface WrapUpFacts {
+  /** Pending todo items at wrap-up time. */
+  todos: string[]
+  /** Number the coming compaction will carry for this session (1-based). */
+  epoch: number
+  /** Absolute path the note must be written to (session directory). */
+  notePath: string
 }
 
 /** Policy switches governing level selection. */
@@ -104,7 +117,8 @@ function levelBlock(level: ResumeLevel, facts: ResumeFacts): string {
       : '1) 大文件阅读切成按需片段（用 read 精确取片，而不是整文件通读）；\n'
         + '2) 已确认的结论写进 todo_write，不要留在上下文里；\n'
     return head + delegation
-      + '3) 若仍无法收敛，把当前状态写入工作区 .handoff/ 下的一个 md 文件，停下并向用户报告。'
+      + `3) 若仍无法收敛，把当前状态写入 \`${facts.noteDir ?? '.handoff/'}\` 下的一个 md 文件，`
+      + '停下并向用户报告。'
   }
   return ''
 }
@@ -152,8 +166,13 @@ export function decideResume(template: string, facts: ResumeFacts, policy: Resum
 /**
  * Render the wrap-up reminder.
  * @param template - wrap-up template (settings/config/built-in).
- * @param todos - pending todos at wrap-up time, when the session has any.
+ * @param facts - measured facts: pending todos, the coming compaction's number,
+ *   and the note path that number determines.
  */
-export function buildWrapUpPrompt(template: string, todos: readonly string[]): string {
-  return `${substitute(template, { todos: todos.join(' / ') }).trimEnd()}${todoBlock(todos)}`
+export function buildWrapUpPrompt(template: string, facts: WrapUpFacts): string {
+  return `${substitute(template, {
+    todos: facts.todos.join(' / '),
+    epoch: String(facts.epoch),
+    notePath: facts.notePath,
+  }).trimEnd()}${todoBlock(facts.todos)}`
 }

@@ -164,6 +164,11 @@ describe('context-guard full loop', () => {
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(2)
     expect(messages[0]!.text).toContain('收尾')
+    // The reminder sends the note to this session's own directory (the test
+    // session has no cwd, so the base is relative) and numbers the coming cut.
+    expect(messages[0]!.text).toContain('.handoff/sessions/a1/epoch-1.handoff.md')
+    expect(messages[0]!.text).toContain('第 1 次压缩')
+    expect(messages[0]!.text).not.toContain('文件名自定')
     const wrapUpSeq = messages[0]!.seq
     const wrapUpResponse = [...agent.session.snapshotEvents()].find(e =>
       e.type === 'assistant/message'

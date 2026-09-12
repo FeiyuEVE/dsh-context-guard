@@ -89,6 +89,14 @@
   正常态（`agentPreset: standard` → `compaction-basic`，事件里 `provider=deepseek-official`、
   `maxTokens=8192`；本引擎是 `provider=context-guard`、`maxTokens=0`），此时 `.handoff/sessions/`
   为空不是缺陷。
+- **agent 写的文件，路径必须由插件喂（2026-09-12 用户提问发现）**：分会话只做在「引擎写的」产物上
+  是不够的 —— 收尾接力笔记是**模型**按提示词写的，而**模型不知道自己的会话 id**（system prompt 里没有），
+  提示词若只说「写入 `.handoff/`，文件名自定」，结果就是一堆与会话无关的 `<日期>-<主题>.md` 堆在根目录
+  （实测 12 份、跨 12 个工作流，只有 1 份自己写了 id）。修法：插件把 `{{notePath}}` 算好塞进提示词
+  （`sessions/<完整id>/epoch-<N>.handoff.md`），并要求标题带序号。**推论**：凡是「让 agent 落盘」的
+  提示词，落点都得由知道 id 的一方给出，别让模型自己编路径。
+  另一个可选细节：`write` 工具（`fs-local/src/fsio.ts:581`）会 `mkdir -p` 父目录，所以插件不必预建目录 ——
+  空目录因此仍是「该会话从未归档」的可判据。
 
 ## 日志
 

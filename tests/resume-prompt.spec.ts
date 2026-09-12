@@ -97,16 +97,36 @@ describe('decideResume', () => {
 })
 
 describe('buildWrapUpPrompt', () => {
+  /** Facts as the guard computes them: note path in the session's own directory. */
+  const note = {
+    epoch: 3,
+    notePath: '/w/.handoff/sessions/a1/epoch-3.handoff.md',
+  }
+
   it('renders the built-in template and appends the live todo list', () => {
-    const prompt = buildWrapUpPrompt(DEFAULT_WRAP_UP_PROMPT, ['未完成任务 A'])
+    const prompt = buildWrapUpPrompt(DEFAULT_WRAP_UP_PROMPT, { todos: ['未完成任务 A'], ...note })
     expect(prompt).toContain('收尾')
     expect(prompt).toContain('todo_write')
     expect(prompt).toContain('接力总结')
     expect(prompt).toContain('- 未完成任务 A')
   })
 
+  it('names the session-scoped note and its compaction number', () => {
+    const prompt = buildWrapUpPrompt(DEFAULT_WRAP_UP_PROMPT, { todos: [], ...note })
+    // The path is the session's own directory, not the flat .handoff/ inbox.
+    expect(prompt).toContain('`/w/.handoff/sessions/a1/epoch-3.handoff.md`')
+    expect(prompt).not.toContain('.handoff/ 目录下的一个 md 文件')
+    // Both the title and the prose carry the ordinal.
+    expect(prompt).toContain('# 第 3 次压缩 · 接力笔记 · <一句话主题>')
+    expect(prompt).toContain('本会话第 3 次压缩')
+  })
+
   it('substitutes {{todos}} and stays empty when the template is disabled', () => {
-    expect(buildWrapUpPrompt('待办：{{todos}}', ['A', 'B'])).toContain('待办：A / B')
-    expect(buildWrapUpPrompt('', ['A'])).toContain('- A')
+    expect(buildWrapUpPrompt('待办：{{todos}}', { todos: ['A', 'B'], ...note })).toContain('待办：A / B')
+    expect(buildWrapUpPrompt('', { todos: ['A'], ...note })).toContain('- A')
+  })
+
+  it('leaves an unknown placeholder visible rather than dropping it', () => {
+    expect(buildWrapUpPrompt('{{what}}', { todos: [], ...note })).toContain('{{what}}')
   })
 })
