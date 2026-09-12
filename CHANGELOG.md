@@ -4,6 +4,48 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.3.5] - 2026-09-12
+
+### 新增
+
+- **旁挂式归档：不接管压缩，也能拿到 raw + digest**。此前「确定性归档」只在会话把 preset 的
+  `compaction` 行换成插件自带 `ArchiveCutEngine` 时才发生；线上 `standard` preset 走
+  `compaction-basic`（模型摘要），于是这些会话的 `.handoff/sessions/` 一直是空的（0.3.3 记录了
+  这个「归档空转」）。现在守卫自己监听 `compaction/summary`：
+  - **别的引擎压缩时**（`provider !== 'context-guard'`）—— 按 `shadowedSeqs` 把被遮蔽的区间从会话
+    日志取回（`session.eventAt` + `deriveEventMessage`），用同一格式补写
+    `epoch-<N>.raw.md` + `epoch-<N>.digest.md` 与两个 `latest*` 指针（**旁挂**）；
+  - **本插件引擎压缩时** —— 跳过：它已在 `summarize()` 里写完，且写盘先于覆盖。
+
+  **模型看到的 checkpoint 完全由 dsh 自己的压缩机决定**：不覆写 `summarize()`、不改压缩事务、
+  不动 dsh 放进上下文的替换消息。直接收益是**零 preset 改动** —— `standard` preset 的 web 会话，
+  以及手动 `/compact`，现在都有归档与 digest。
+- 写盘逻辑抽成模块级 `writeArchive()`（新 `src/archive.ts`）：`ArchiveCutEngine` 与守卫共用同一份
+  实现，且**不把 `@deepseek-ai/dsh-compaction-basic` 的运行时类拖进 host 半边**（实测 `lib/index.mjs`
+  与其共享 chunk 没有任何 dsh 运行时 import，那一串只出现在注释里）。`writeArchive` 新增 `minEpoch`：
+  调用方若已知本会话压缩总数（守卫）可以钉住序号，扫描结果更高时以扫描为准，**任何情况下不重号**。
+- 续跑提示改走**记录优先**：守卫按 `compactionId → {rawPath, digestPath}` 记住自己写的文件
+  （值是在途 promise，续跑渲染时 `await`，避免「写盘比续跑慢」抢跑）。`compaction-basic` 的
+  checkpoint 是模型摘要、没有帧标记，这条记录是它唯一可信的路径来源；`FRAME_MARKER` 帧解析保留给
+  自家引擎的指针帧。
+
+### 变更
+
+- `resolveDigestConfig(user, entry?)` 第二参数改为可选（守卫侧没有自己的引擎行）。
+- 归档写入器的日志 scope 参数化：引擎写 `context-guard/digest:`，旁挂写 `context-guard/sidecar:`
+  （事件名与字段一致，便于同口径 grep）。
+
+### 已知取舍（知情接受）
+
+- **落盘不保证先于覆盖**：`session/event` 是 cordis `emit`（同步分发、**不 await** 监听器），而
+  `compaction/summary` 之后紧接（中间无 `await`）就是区间替换消息。进程恰好在该窗口被杀只丢这一份
+  归档，checkpoint 不受影响（模型摘要照旧）；写盘一律 tmp + `rename`，不会留半截文件。
+- **路径只能靠续跑提示进上下文**：关掉 `resumeAfterCompact`、agent 非空闲、或下一次压缩裁掉那条
+  消息时，模型看不到路径（文件仍在磁盘上）。
+- 只归档 `compaction/summary`；模型无关的 `compaction/prune` 不写归档（无摘要区间，混入同一套
+  `epoch-N` 编号会让 digest 与序号错位）。
+- 会话无 `cwd` 时不写（`.handoff` 会相对宿主进程工作目录解析），记一行 `sidecar: skipped reason=no-cwd`。
+
 ## [0.3.4] - 2026-09-12
 
 ### 变更

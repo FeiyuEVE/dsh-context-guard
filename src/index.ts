@@ -19,6 +19,13 @@
  * 3. `compaction/end` — after a successful compaction of an idle agent, the
  *    guard queues a continuation prompt and wakes the driver, so the task
  *    resumes on the compacted surface instead of sitting idle.
+ * 4. `compaction/summary` — for a compaction some *other* backend ran (the
+ *    `standard` preset's `compaction-basic`, a manual `/compact`), the guard
+ *    writes the deterministic `raw` + `digest` pair beside that backend's
+ *    checkpoint. The backend stays in charge of the checkpoint the model sees;
+ *    this is a side-car, and it is why the archive works with zero preset
+ *    edits. Compactions this plugin's own engine ran are skipped — it wrote
+ *    them itself, before the region was shadowed.
  *
  * The continuation prompt is not a fixed string: it is rendered from measured
  * facts (how often this session compacted inside a sliding window, the digest
@@ -41,13 +48,16 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { Message } from '@deepseek-ai/dsh-llm'
+import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
 // Type-only: pulls in the `ctx.compaction` / `ctx.tokenMeter` / `ctx.settings`
 // declaration merges.
 import type {} from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import type {} from '@deepseek-ai/dsh-settings'
+import { writeArchive } from './archive.ts'
+import type { Artifacts } from './archive.ts'
 import { DIGEST_FORMAT_VERSION, FRAME_MARKER, digestPathFrom, estimateTextTokens } from './digest.ts'
 import { createLogSink, logInfo, logWarn } from './log.ts'
 import { archiveLocation, digestPointerCandidates, handoffNotePath } from './paths.ts'
@@ -64,7 +74,14 @@ import {
   lastHumanIntent,
   pendingTodos,
 } from './session-facts.ts'
-import { SETTINGS_DEFAULTS, SETTINGS_NAMESPACE, overridesOf, settingsSchema, withDefaults } from './settings.ts'
+import {
+  SETTINGS_DEFAULTS,
+  SETTINGS_NAMESPACE,
+  overridesOf,
+  resolveDigestConfig,
+  settingsSchema,
+  withDefaults,
+} from './settings.ts'
 import type { ContextGuardSettingsValue, ThresholdOverrides } from './settings.ts'
 
 export const name = 'context-guard'
@@ -134,6 +151,18 @@ const WRAP_UP_SUMMARY = '上下文超过阈值，已提醒 agent 收尾'
 const RESUME_SUMMARY = '上下文已压缩，已恢复任务'
 /** One-line account of a suppressed resume for collapsed transcript rows. */
 const RESUME_HOLD_SUMMARY = '压缩过于频繁，已暂停自动续跑'
+
+/**
+ * Filename prefix shared by every artifact of one compaction: the side-car
+ * `raw`/`digest` pair, the engine's pair, and the wrap-up note. The guard does
+ * not read the engine row's `epochPrefix` config, so it uses the default; a
+ * row that renames its prefix gets two naming schemes in one directory, which
+ * is why the default is the only prefix the guard ever assumes.
+ */
+const EPOCH_PREFIX = 'epoch'
+
+/** How many `compactionId → archive paths` records one session keeps. */
+const ARCHIVE_RECORD_LIMIT = 8
 
 /** Request pressure relative to the routed model's context capacity. */
 interface Pressure {
@@ -401,12 +430,26 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   /**
+   * Absolute archive base directory for one agent, or undefined when the
+   * session exposes no working directory.
+   *
+   * A base that is not absolute is *not* usable for writing: `.handoff` would
+   * resolve against whatever directory the host process happens to run in.
+   * {@link sessionArchiveDir} still falls back to the relative form because it
+   * only renders prompt text.
+   */
+  function archiveBase(agent: Agent): string | undefined {
+    const cwd = agent.session.header?.cwd
+    if (cwd === undefined || cwd.length === 0) return undefined
+    return path.join(cwd, '.handoff')
+  }
+
+  /**
    * This session's artifact directory: the same resolved base and layout the
    * engine archives into, since both read the same settings layer.
    */
   function sessionArchiveDir(agent: Agent): string {
-    const cwd = agent.session.header?.cwd
-    const base = cwd !== undefined && cwd.length > 0 ? path.join(cwd, '.handoff') : '.handoff'
+    const base = archiveBase(agent) ?? '.handoff'
     return archiveLocation(base, String(agent.session.id), settings().archiveLayout).dir
   }
 
@@ -429,6 +472,116 @@ export function apply(ctx: Context, config: Config = {}): void {
     return { epoch, path: handoffNotePath(dir, epoch), dir: `${dir}/` }
   }
 
+  /**
+   * What the guard's own side-car writer produced for one compaction, keyed by
+   * `compactionId` inside one session. The value is the *in-flight* promise,
+   * so the continuation prompt can wait for it: the write is fire-and-forget
+   * from `compaction/summary`, while the continuation is rendered one
+   * `compaction/end` later — from a microtask that routinely wins the race
+   * against the first filesystem call.
+   *
+   * The continuation prompt must name files that exist, and a
+   * `compaction-basic` checkpoint is a model-written summary that carries no
+   * path — the guard's own frame marker is absent from it by definition. This
+   * record is the guard's own memory of what *it* wrote, and it is
+   * authoritative in a way a text scrape can never be, so it is consulted
+   * first; the frame scan remains for compactions this guard did not archive
+   * (an `ArchiveCutEngine` preset, whose frame does carry the paths).
+   */
+  const archiveRecords = new WeakMap<Session, Map<string, Promise<Artifacts>>>()
+
+  /** Remember one compaction's pending or landed artifacts, keeping the newest few. */
+  function recordArchive(session: Session, compactionId: string, work: Promise<Artifacts>): void {
+    let records = archiveRecords.get(session)
+    if (records === undefined) {
+      records = new Map()
+      archiveRecords.set(session, records)
+    }
+    records.set(compactionId, work)
+    while (records.size > ARCHIVE_RECORD_LIMIT) {
+      const oldest = records.keys().next()
+      if (oldest.done === true) break
+      records.delete(oldest.value)
+    }
+  }
+
+  /**
+   * Archive one compaction the guard did not run itself.
+   *
+   * This is the "side-car" half of the plugin: whatever engine the preset
+   * mounted stays in charge of the checkpoint the model sees, and the guard
+   * only adds the deterministic `raw` + `digest` pair beside it. Everything
+   * here is fire-and-forget — `session/event` is a plain cordis `emit`, whose
+   * listeners are not awaited, and the backend appends the region's
+   * replacement immediately after this event. The region's events are read
+   * from the append-only log, so they are still there when this runs; the
+   * files, however, may land after the surface has already moved on (see
+   * `docs/gotchas.md`).
+   *
+   * @param session - session whose compaction committed the summary.
+   * @param compactionId - id of that compaction, the key of the archive record.
+   * @param shadowedSeqs - the shadowed surface nodes, captured synchronously.
+   * @returns what landed; never rejects.
+   */
+  async function writeSidecar(
+    session: Session,
+    compactionId: string,
+    shadowedSeqs: readonly SessionSeq[],
+  ): Promise<Artifacts> {
+    try {
+      const agent = ctx.agents.get(session.id)
+      const base = agent === undefined ? archiveBaseFromSession(session) : archiveBase(agent)
+      if (base === undefined) {
+        logWarn(log, 'sidecar', 'skipped', { reason: 'no-cwd', session: String(session.id) })
+        return {}
+      }
+      const messages = shadowedSeqs
+        .map(seq => session.eventAt(seq))
+        .filter((event): event is SessionEvent => event !== undefined)
+        .map(event => session.deriveEventMessage(event))
+        .filter((message): message is Message => message !== null)
+      if (messages.length === 0) {
+        logWarn(log, 'sidecar', 'skipped', { reason: 'empty-region', session: String(session.id) })
+        return {}
+      }
+      const resolved = settings()
+      // The same number the wrap-up note carried: this compaction's ordinal
+      // among the session's compactions. `compaction/end` has not been
+      // appended yet, so the pace still counts the compactions before this one.
+      const epoch = compactionPace(session, Date.now(), resolved.resumeWindowMinutes).sessionTotal + 1
+      const artifacts = await writeArchive({
+        base,
+        layout: resolved.archiveLayout,
+        epochPrefix: EPOCH_PREFIX,
+        sessionId: String(session.id),
+        messages,
+        config: resolveDigestConfig(resolved),
+        log,
+        logScope: 'sidecar',
+        minEpoch: epoch,
+      })
+      logInfo(log, 'sidecar', 'archived', {
+        session: String(session.id),
+        compaction: compactionId,
+        epoch: artifacts.epoch,
+        messages: messages.length,
+        raw: artifacts.rawPath,
+        digest: artifacts.digestPath,
+      })
+      return artifacts
+    } catch (error: unknown) {
+      logWarn(log, 'sidecar', 'failed', { session: String(session.id), error: String(error) })
+      return {}
+    }
+  }
+
+  /** {@link archiveBase} for a session whose agent is no longer registered. */
+  function archiveBaseFromSession(session: Session): string | undefined {
+    const cwd = session.header?.cwd
+    if (cwd === undefined || cwd.length === 0) return undefined
+    return path.join(cwd, '.handoff')
+  }
+
   ctx.on('session/event', (session, event) => {
     if (event.type === 'step/end') {
       const agent = ctx.agents.get(session.id)
@@ -441,6 +594,20 @@ export function apply(ctx: Context, config: Config = {}): void {
         .catch((error: unknown) => {
           logWarn(log, '', 'step-end-failed', { agent: agent.id, error: String(error) })
         })
+      return
+    }
+    if (event.type === 'compaction/summary') {
+      // A `context-guard` summary is this plugin's own engine, which already
+      // wrote the pair while it summarized — before the region was shadowed.
+      // Only other backends need the side-car.
+      if (event.data.provider !== 'context-guard') {
+        const compactionId = String(event.data.compactionId)
+        recordArchive(
+          session,
+          compactionId,
+          writeSidecar(session, compactionId, [...event.data.shadowedSeqs]),
+        )
+      }
       return
     }
     if (event.type !== 'compaction/end') return
@@ -468,13 +635,22 @@ export function apply(ctx: Context, config: Config = {}): void {
       const template = pickTemplate(resolved.resumePromptTemplate, resumePrompt, DEFAULT_RESUME_PROMPT)
       if (template.length === 0) return
       const frame = checkpointText(agent.session, compactionId)
-      // Only the deterministic frame this engine returns describes real
-      // archives; a foreign summary's paths are prose. Every pointer is then
-      // re-checked against the filesystem, so the prompt never names a file
-      // that is not there.
+      // Two sources, in trust order:
+      // 1. the guard's own record of the side-car it wrote for this exact
+      //    compaction — exact, and the only source for a backend whose
+      //    checkpoint is a model-written summary;
+      // 2. the deterministic pointer frame an `ArchiveCutEngine` returns,
+      //    which describes real archives only when it carries the marker
+      //    (a foreign summary's paths are prose).
+      // Every pointer is then re-checked against the filesystem, so the
+      // prompt never names a file that is not there.
+      const pending = archiveRecords.get(agent.session)?.get(compactionId)
+      const recorded = pending === undefined ? undefined : await pending
       const ownsFrame = frame.includes(FRAME_MARKER)
-      const digestPath = await existingFile(ownsFrame ? await digestPathFor(agent, frame) : undefined)
-      const rawPath = await existingFile(ownsFrame ? rawPathFrom(frame) : undefined)
+      const digestPath = await existingFile(
+        recorded?.digestPath ?? (ownsFrame ? await digestPathFor(agent, frame) : undefined),
+      )
+      const rawPath = await existingFile(recorded?.rawPath ?? (ownsFrame ? rawPathFrom(frame) : undefined))
       const pace = compactionPace(agent.session, Date.now(), resolved.resumeWindowMinutes)
       const delegation = availableToolNames(agent.session)
         .filter(tool => delegationTools.includes(tool))

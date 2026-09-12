@@ -183,11 +183,12 @@ export interface ResolvedDigestConfig {
  * Resolve the digest knobs for one compaction: user settings, then the
  * engine's composition entry, then the built-in default.
  * @param user - the namespace's raw user layer, when the guard registered one.
- * @param entry - the engine row's own config.
+ * @param entry - the engine row's own config; absent for a caller with no row
+ *   of its own (the guard's side-car writer reads only the settings layer).
  */
 export function resolveDigestConfig(
   user: Partial<ContextGuardSettingsValue> | undefined,
-  entry: EngineDigestConfig | undefined,
+  entry?: EngineDigestConfig,
 ): ResolvedDigestConfig {
   return {
     enabled: user?.digestEnabled ?? entry?.enabled ?? SETTINGS_DEFAULTS.digestEnabled,

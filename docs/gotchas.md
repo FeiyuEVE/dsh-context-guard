@@ -64,6 +64,23 @@
 
 ## 归档与 digest
 
+- **旁挂归档不能保证「写盘先于覆盖」（2026-09-12，0.3.5 设计时确认）**：守卫的旁挂写盘挂在
+  `compaction/summary` 上，而这个事件**不是**可等待的钩子 —— `session/event` 走 cordis 的 `emit`
+  （`vendor/cordis/lib/index.js` 注释原文：run listeners synchronously *without waiting for returned
+  promises*），而 `compaction-basic/src/region.ts` 在追加 `compaction/summary`（476 行）之后
+  **紧接**（中间无 `await`）就在 489 行追加替换消息。所以：区间取回用的是**只增日志**
+  （`session.eventAt(seq)` 读 `this.log[seq]`，替换只改表层投影，不动日志），因此取内容永远安全；
+  但写文件是 fire-and-forget，进程在该窗口被杀只丢这一份归档，checkpoint 不受影响。
+  **推论**：不要把「归档已落盘」当成压缩事务的前置条件；也不要在旁挂路径上做需要与替换串行的动作。
+  引擎那条路（`ArchiveCutEngine` 覆写 `summarize()`）没有这个弱化 —— 写盘发生在 `summarize()` 返回
+  之前，早于替换。两条路的差别就写在这里，改代码前先想清楚在哪条路上。
+- **旁挂写盘不能 `void` 完就算**：续跑提示在 `compaction/end` 之后的一个 microtask 里渲染，
+  通常**赢过**旁挂第一次 `mkdir` 的 I/O 回调。因此记录表存的是**在途 promise**，渲染时 `await`；
+  否则 `compaction-basic` 会话（checkpoint 里没有路径）永远渲染「本次未生成摘要文件」。
+  实测症状：`resume: sent … digest=undefined` 而盘上文件已经存在。
+- **`writeArchive` 的 `minEpoch` 语义**：`max(扫描值, minEpoch)`。守卫知道自己会话的压缩总数
+  （`compactionPace().sessionTotal + 1`，与收尾笔记 `{{epoch}}` 同源），引擎只管扫描。
+  低报不会让序号倒退（扫描优先），高报只是留空洞 —— **任何一侧都不允许重号覆盖别人**。
 - **落点**（默认 `session` 布局）：`<archiveDir 或 cwd>/.handoff/sessions/<sessionDirName(会话id)>/`
   下 `epoch-<N>.raw.md` + `epoch-<N>.digest.md` + `latest.txt` + `latest-digest.txt`；N 在本会话目录
   内递增。目录名用**完整会话 id**，清洗改变原 id 时附 `-<sha256[0..8]>`。`archiveLayout: 'flat'` 保留
@@ -87,8 +104,10 @@
   回归用例：`tests/context-guard.spec.ts` 的 `resume archive pointers`（含外域摘要、真文件、文件已删
   三种）与 `tests/digest.spec.ts` 的 `digestPathFrom`。**排查口径**：非归档引擎的会话「没有归档」是
   正常态（`agentPreset: standard` → `compaction-basic`，事件里 `provider=deepseek-official`、
-  `maxTokens=8192`；本引擎是 `provider=context-guard`、`maxTokens=0`），此时 `.handoff/sessions/`
-  为空不是缺陷。
+  `maxTokens=8192`；本引擎是 `provider=context-guard`、`maxTokens=0`）。
+  **0.3.5 起这条口径更新**：`standard` 会话现在由守卫旁挂写归档，`provider != context-guard`
+  正是旁挂的触发条件；`provider=context-guard` 才是「引擎已写、守卫跳过」。而路径解析的第一来源
+  不再是帧，而是守卫自己按 `compactionId` 存下的写盘记录（见上一条）。
 - **agent 写的文件，路径必须由插件喂（2026-09-12 用户提问发现）**：分会话只做在「引擎写的」产物上
   是不够的 —— 收尾接力笔记是**模型**按提示词写的，而**模型不知道自己的会话 id**（system prompt 里没有），
   提示词若只说「写入 `.handoff/`，文件名自定」，结果就是一堆与会话无关的 `<日期>-<主题>.md` 堆在根目录

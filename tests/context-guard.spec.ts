@@ -6,7 +6,7 @@
  * configuration switches.
  */
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -93,6 +93,10 @@ function fakeSettings(initial: ThresholdSettingsValue & Record<string, unknown>)
  *   returns an `agentPresets`-shaped service (or undefined). Mirrors the real
  *   topology where the guard is a host row and the compaction provider lives
  *   in the agent's preset realm, reachable only through this seam.
+ * @param cwd - the session's working directory; sets where the guard's
+ *   side-car writer archives (`<cwd>/.handoff`). Without one the session has
+ *   no resolvable archive base, exactly like a session created outside any
+ *   workspace.
  */
 async function harness(
   script: ScriptEntry[],
@@ -101,6 +105,7 @@ async function harness(
   withCompaction = true,
   settings?: ReturnType<typeof fakeSettings>,
   presets?: (ctx: Context) => { serviceFor(agent: { ctx: Context }, name: string): unknown } | undefined,
+  cwd?: string,
 ): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine | undefined; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
@@ -119,7 +124,11 @@ async function harness(
   }))
   const adapter = new MockAdapter(script, contextWindow)
   ctx.llm.registerAdapter(['mock'], adapter)
-  const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+  const agent = await ctx.agentLoop.create(
+    SessionId('a1'),
+    { provider: 'mock', model: 'mock' },
+    cwd === undefined ? {} : { cwd },
+  )
   agent.followup(createUserMessage({ content: [{ type: 'text', text: TASK_TEXT }], source: { kind: 'user' } }))
   return { ctx, agent, compaction, adapter }
 }
@@ -688,6 +697,172 @@ describe('resume archive pointers', () => {
     const text = await cutOnceAndResume(compaction!, agent, adapter)
     expect(text).toContain('（本次未生成摘要文件）')
     expect(text).not.toContain('/nonexistent-cg/epoch-7.digest.md')
+    void ctx
+  })
+})
+
+/**
+ * The side-car writer.
+ *
+ * The point of the feature is that the archive works *without* taking over
+ * compaction: a session on the `standard` preset runs `compaction-basic`, whose
+ * checkpoint is a model-written summary that names no file, and the guard adds
+ * the deterministic pair beside it. These tests therefore use a foreign
+ * (non-`context-guard`) provider string on the stub backend and a real session
+ * `cwd`, and assert on both the files and the continuation prompt.
+ */
+describe('side-car archiving beside a foreign compaction engine', () => {
+  const tmpDirs: string[] = []
+  afterEach(async () => {
+    await Promise.all(tmpDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function workspace(): Promise<string> {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'cg-sidecar-'))
+    tmpDirs.push(dir)
+    return dir
+  }
+
+  /** Cut once and wait for the post-cut continuation to settle. */
+  async function cutOnce(
+    compaction: StubCompactionEngine,
+    agent: Agent,
+    adapter: MockAdapter,
+    expectedRequests: number,
+  ): Promise<void> {
+    expect(await compaction.compactNow(agent, new AbortController().signal)).not.toBeNull()
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(expectedRequests)
+      expect(agent.status).toBe('idle')
+    })
+  }
+
+  it('writes raw + digest for a foreign backend and names them in the continuation', async () => {
+    const cwd = await workspace()
+    const { ctx, agent, compaction, adapter } = await harness(
+      [textResponse('first'), textResponse('resumed')],
+      {},
+      4000,
+      true,
+      undefined,
+      undefined,
+      cwd,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    // The `standard`-preset shape: a model-written prose summary with no paths.
+    compaction!.summaryText = '模型写的摘要：我们改了三个文件，还剩两件事。'
+    await cutOnce(compaction!, agent, adapter, 2)
+
+    const sessionDir = path.join(cwd, '.handoff', 'sessions', 'a1')
+    expect((await readdir(sessionDir)).sort()).toEqual([
+      'epoch-1.digest.md',
+      'epoch-1.raw.md',
+      'latest-digest.txt',
+      'latest.txt',
+    ])
+    // The raw archive holds the shadowed region verbatim, and the digest is the
+    // deterministic document — not the model's summary.
+    const raw = await readFile(path.join(sessionDir, 'epoch-1.raw.md'), 'utf8')
+    expect(raw).toContain('# 会话归档')
+    expect(raw).toContain('start start')
+    const digest = await readFile(path.join(sessionDir, 'epoch-1.digest.md'), 'utf8')
+    expect(digest).toContain('<!-- context-guard-digest v1 -->')
+    expect(digest).toContain('- 会话: a1')
+    expect(digest).toContain('- 第几次: 1')
+
+    // The continuation prompt names both real files. It is rendered after
+    // `compaction/end`, and the write is fire-and-forget from
+    // `compaction/summary`, so this also covers the wait on the in-flight
+    // write.
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(1)
+    expect(messages[0]!.text).toContain(path.join(sessionDir, 'epoch-1.digest.md'))
+    expect(messages[0]!.text).toContain(path.join(sessionDir, 'epoch-1.raw.md'))
+    expect(messages[0]!.text).not.toContain('（本次未生成摘要文件）')
+    expect(messages[0]!.text).not.toContain('（本次未生成归档文件）')
+    void ctx
+  })
+
+  it('numbers the side-car like the wrap-up note and continues across cuts', async () => {
+    const cwd = await workspace()
+    const { ctx, agent, compaction, adapter } = await harness(
+      [textResponse('first'), textResponse('resumed once'), textResponse('grown'), textResponse('resumed twice')],
+      {},
+      4000,
+      true,
+      undefined,
+      undefined,
+      cwd,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    await cutOnce(compaction!, agent, adapter, 2)
+
+    // Grow the surface without a human message, so the compaction count is not
+    // reset, then cut again.
+    agent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'grow '.repeat(200) }],
+      source: { kind: 'plugin', plugin: 'test' },
+    }))
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(3)
+      expect(agent.status).toBe('idle')
+    })
+    await cutOnce(compaction!, agent, adapter, 4)
+
+    const sessionDir = path.join(cwd, '.handoff', 'sessions', 'a1')
+    expect((await readdir(sessionDir)).filter(name => name.endsWith('.raw.md')).sort())
+      .toEqual(['epoch-1.raw.md', 'epoch-2.raw.md'])
+    const second = await readFile(path.join(sessionDir, 'epoch-2.digest.md'), 'utf8')
+    expect(second).toContain('- 第几次: 2')
+    // Carry-forward keeps the first cut's content alive through the second.
+    expect(second).toContain('- 继承: 第 1 次')
+    const messages = guardMessages(agent)
+    expect(messages[1]!.text).toContain(path.join(sessionDir, 'epoch-2.digest.md'))
+    void ctx
+  })
+
+  it('skips a compaction its own engine already archived', async () => {
+    const cwd = await workspace()
+    const { ctx, agent, compaction, adapter } = await harness(
+      [textResponse('first'), textResponse('resumed')],
+      {},
+      4000,
+      true,
+      undefined,
+      undefined,
+      cwd,
+    )
+    await vi.waitFor(() => {
+      expect(adapter.requests).toHaveLength(1)
+      expect(agent.status).toBe('idle')
+    })
+    // The guard's own engine reports provider `context-guard` and returns a
+    // pointer frame; it wrote the pair while summarizing, so the side-car must
+    // stay out of the way (no second epoch, no overwrite).
+    const sessionDir = path.join(cwd, '.handoff', 'sessions', 'a1')
+    compaction!.provider = 'context-guard'
+    compaction!.summaryText = [
+      `${FRAME_MARKER}（未调用模型摘要请求）。`,
+      `- 精简接力摘要：\`${path.join(sessionDir, 'epoch-1.digest.md')}\``,
+    ].join('\n')
+    await cutOnce(compaction!, agent, adapter, 2)
+
+    // Nothing was written anywhere by the guard: the engine in this test is a
+    // stub that only lands the transaction, so an empty workspace proves the
+    // side-car skipped the compaction instead of archiving what the engine
+    // already owns.
+    await expect(readdir(path.join(cwd, '.handoff'))).rejects.toThrow()
+    // The continuation still names the frame's path... which the guard
+    // withholds, because a frame that claims a file that does not exist must
+    // not send the resumed agent there.
+    const messages = guardMessages(agent)
+    expect(messages[0]!.text).toContain('（本次未生成摘要文件）')
     void ctx
   })
 })

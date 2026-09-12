@@ -33,6 +33,14 @@ export class StubCompactionEngine extends CompactionEngine {
    */
   summaryText = 'stub summary of the compacted range'
 
+  /**
+   * Provider string recorded on the summary event. `context-guard` is the
+   * guard's own deterministic engine, which archives while it summarizes; any
+   * other value stands for a foreign backend, beside which the guard must
+   * write its own side-car archive.
+   */
+  provider = 'mock'
+
   override async compactIfNeeded(
     _agent: CompactionAgentContext,
     _trigger: CompactionTrigger,
@@ -76,7 +84,7 @@ export class StubCompactionEngine extends CompactionEngine {
         shadowedRange: { start, end },
         shadowedSeqs,
         shadowedTokenCount: 100,
-        provider: 'mock',
+        provider: this.provider,
         model: 'stub',
         rawOutput: summary,
         llmStreamCall: true,

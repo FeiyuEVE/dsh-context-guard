@@ -7,7 +7,8 @@
 
 ## 1. 为什么有第二个文件
 
-archive-cut 引擎已经把被裁区间**无损**导成 `epoch-N.raw.md`。那个文件很贵：本工作区一个真实
+被裁区间已经被**无损**导成 `epoch-N.raw.md`（0.3.5 起由共用写盘器 `src/archive.ts` 产出，默认走
+守卫的旁挂路径，见 §7）。那个文件很贵：本工作区一个真实
 epoch 约 30 KB ≈ 8k tokens，读回来几乎抵掉这次压缩省下的量。所以每次压缩写**两份**产物：
 
 | 文件 | 性质 | 谁读 | 典型体量 |
@@ -168,9 +169,12 @@ targetTokens = max(260, min(digestMaxTokens, regionTokens × digestTargetRatio))
   不可误读旧结构。
 - 文件级去重：本区间新出现的路径会顶掉继承来的同路径条目（比较 `— ` 之前的部分）。
 
-## 7. 进上下文的只有帧，不是本文档
+## 7. 进上下文的只有帧或续跑提示，不是本文档
 
-压缩后替换被测区间的 checkpoint 帧（`ArchiveCutEngine.frameText`，见 `src/compaction.ts`）形如：
+同一份 digest 由两条路产出（共用 `src/archive.ts` 的 `writeArchive()`，格式完全相同）：
+
+- **接管模式**（可选）：`ArchiveCutEngine.frameText`（见 `src/compaction.ts`）产出的 checkpoint
+  帧就是路径清单，形如：
 
 ```
 本段历史已由 dsh-context-guard 确定性归档（未调用模型摘要请求）。
@@ -180,6 +184,10 @@ targetTokens = max(260, min(digestMaxTokens, regionTokens × digestTargetRatio))
 需要细节时用 read 工具按需读取该文件恢复状态，不要在上下文中复述。
 请直接继续执行截断前正在进行的任务。
 ```
+
+- **旁挂模式**（默认）：checkpoint 是原压缩机的产物（如 `compaction-basic` 的模型摘要），不含路径；
+  路径改由**续跑提示**给出，来源是守卫按 `compactionId` 存的写盘记录（本文件不规定提示词文本，
+  见 `src/resume-prompt.ts`）。
 
 **帧必须瘦**：基类（`compaction-basic`）强制「摘要必须小于被替换内容」的收缩不变量，帧写胖了会
 在小区间上直接让压缩失败（`summary is not smaller than the shadowed content`）。所以 `- 线索：`

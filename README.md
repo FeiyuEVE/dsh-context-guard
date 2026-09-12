@@ -24,7 +24,7 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
 
 ## 功能 / Features
 
-每会话一个闭环，由三个事件触发（各自有开关）：
+每会话一个闭环，由四个事件触发（各自有开关）：
 
 1. **hook `step/end`** —— 步骤结束时评估会话上下文（`tokenMeter` 测量 / 路由模型的 `contextWindow`）。
    超过阈值、且该步骤仍欠模型一次请求（assistant 消息带工具调用）时，把「尽快收尾」提醒折叠进
@@ -34,11 +34,24 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
    （防止压缩-续跑死循环）。
 3. **hook `compaction/end`** —— 压缩成功（无 `error`）且 agent 空闲时，**按压缩频率分级**渲染续跑
    提示并 `followup()` 唤醒，在压缩后的表层上续跑。失败、agent 运行中、或频率超上限时按规则不唤醒。
+4. **hook `compaction/summary`（旁挂归档）** —— 压缩由**别人**执行时（`standard` preset 的
+   `compaction-basic`、手动 `/compact`），守卫把被遮蔽的区间取回来，按同一格式补写
+   `epoch-N.raw.md` + `epoch-N.digest.md`。**模型看到的 checkpoint 完全由 dsh 自己的压缩机决定**，
+   本插件只是往旁边加文件 —— 不覆写 `summarize()`、不改压缩事务。
 
 ### 归档与接力摘要
 
-压缩后端可换成插件自带的 `ArchiveCutEngine`（导出子路径 `./compaction`，供 preset 引用）。它只
-覆写 `BasicCompactionEngine.summarize()` 这一个受支持的扩展点，**零模型调用**，每次压缩写两份产物：
+归档有**两条路**，产物格式相同、落点相同：
+
+- **旁挂（默认，零配置）**：任何后端压缩时，守卫从 `compaction/summary` 事件拿到被遮蔽的区间，
+  自己写 raw + digest。线上 `standard` preset 走 `compaction-basic`（模型摘要），压缩后模型看到的
+  仍是那份模型摘要 —— 归档只是**旁边多出来的文件**。手动 `/compact` 同理。
+- **接管（可选）**：把 preset 的 `compaction` 行换成插件自带的 `ArchiveCutEngine`（导出子路径
+  `./compaction`）。它只覆写 `BasicCompactionEngine.summarize()` 这一个受支持的扩展点，**零模型调用**，
+  checkpoint 本身就是「路径清单帧」。两种方式不会同时生效：`ArchiveCutEngine` 自己已经写完归档，
+  守卫看到 `provider=context-guard` 会跳过。
+
+产物：
 
 ```
 <cwd>/.handoff/sessions/<会话id>/
@@ -59,8 +72,15 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
   raw 几乎会抵掉压缩省下的量，所以让 agent 先读 digest。
 - **跨次继承**：新 digest 继承上一次的意图/概念/文件/报错小节，避免第二段压缩丢掉更早的历史
   （「摘要的摘要」）。绝不跨会话继承，版本不符则放弃继承。
-- **进入上下文的只有短帧**，不是 digest 正文：帧给路径 + 读取规则（`regionTokens ≥ 600` 时另加一行
-  ≤60 字线索）。格式契约见 [`docs/digest-format.md`](docs/digest-format.md)。
+- **进入上下文的只有短帧**，不是 digest 正文：接管模式下，帧给路径 + 读取规则（`regionTokens ≥ 600`
+  时另加一行 ≤60 字线索）；旁挂模式下 checkpoint 由别人的压缩机决定，路径通过**续跑提示**进入上下文
+  （见下）。格式契约见 [`docs/digest-format.md`](docs/digest-format.md)。
+- **旁挂模式的两点取舍**（已知、接受）：
+  1. `session/event` 是 cordis 的 `emit`（同步分发、**不等待**监听器），而 `compaction/summary` 之后
+     **紧接**（中间无 `await`）就是区间替换 —— 所以落盘不保证先于覆盖。进程恰好在该窗口被杀，只会
+     丢这一份归档，`checkpoint` 不受影响（模型摘要照旧）；写盘一律 tmp + `rename`，不会留半截文件。
+  2. 路径只能靠**续跑提示**进上下文：checkpoint 是别人的摘要，不会带我们的路径。关掉
+     `resumeAfterCompact`、agent 非空闲、或下一次压缩裁掉那条消息时，模型看不到路径（文件仍在磁盘上）。
 
 ### 分级续跑
 
@@ -90,7 +110,8 @@ dsh plugin --profile web add /path/to/dsh-context-guard
 ```
 
 bundle 采用 cost-meter 式单一 Loader 行（`cordis.patch.yml` 只 insert `context-guard` 一行），不干预
-profile 的压缩后端配置。要用确定性归档后端，在 preset 的 `compaction` 行把包名指到
+profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：preset 完全不用改。想改成「接管」式
+（checkpoint 直接变成路径清单帧、写盘先于覆盖），再把 preset 的 `compaction` 行指到
 `@feiyueve/dsh-context-guard/compaction`（或用 `file:` 绝对路径引用 `lib/compaction.mjs`）。
 
 ### 容错设计
@@ -103,10 +124,14 @@ profile 的压缩后端配置。要用确定性归档后端，在 preset 的 `co
   两层都没有时插件照常加载，hook 1 可用，hook 2/3 降级并记录一次警告，**不会 pending、不会阻塞启动**。
 - 越界配置（如 `thresholdRatio: 2`）不抛错：记录 `error` 日志并回退 0.85。
 - 归档写盘失败只 `warn` 不抛：帧降级为「无路径」或「只有 raw」，压缩本身照常成功。
-- **续跑提示里的归档路径只在真有时才写**：路径只从本引擎的确定性指针帧里取（帧首带
-  `dsh-context-guard 确定性归档` 标记），取到后还要落盘确认。所以用 `compaction-basic` 的会话
-  （`standard` preset，即普通 web 会话）不会被告知去读一个不存在的 digest —— 模板里的
-  `{{digest}}`/`{{raw}}` 会渲染成「本次未生成摘要文件 / 归档文件」。
+- **续跑提示里的归档路径只在真有时才写**，两个来源按可信度排序：
+  1. **守卫自己的记录** —— 旁挂归档写完时按 `compactionId → {rawPath, digestPath}` 记下（值是在途
+     promise，续跑渲染时 `await`，因此不会被「写盘比续跑慢」抢跑）。这是 `compaction-basic` 会话
+     唯一可用的来源，因为它的 checkpoint 里根本没有路径。
+  2. **本引擎的确定性指针帧** —— 帧首必须带 `dsh-context-guard 确定性归档` 标记（外域摘要一律不认）。
+
+  两个来源都会再落盘确认一次。所以会话不会被告知去读一个不存在的 digest；确实没有时，模板里的
+  `{{digest}}`/`{{raw}}` 渲染成「本次未生成摘要文件 / 归档文件」。
 - 所有监听器的运行期异常均被包含并记日志，任何情况下都不向外抛出。
 
 ## 配置 / Config
@@ -220,9 +245,12 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
 | `context-guard/digest: raw-written epoch=… session=… layout=… messages=… dir=… file=…` | info | 无损归档已落盘 |
 | `context-guard/digest: written epoch=… session=… region=N/M tokens=…→… budget=… tier=… carriedFrom=… digest=… raw=…` | info | 摘要已落盘（`tier` 见格式契约 §5） |
 | `context-guard/digest: skipped reason=disabled session=…` | info | 摘要被关闭 |
-| `context-guard/digest: no-base-dir agent=…` | warn | 会话无 `cwd` 且未配 `archiveDir` |
+| `context-guard/digest: no-base-dir session=…` | warn | 会话无 `cwd` 且引擎未配 `archiveDir` |
 | `context-guard/digest: write-failed session=… dir=… error=…` | warn | 写盘失败（帧降级，压缩仍成功） |
 | `context-guard/digest: carry-forward-skipped reason=other-session\|unparsable\|version-N-expected-M from=…` | warn | 放弃继承 |
+| `context-guard/sidecar: raw-written …` / `written …` / `skipped reason=disabled …` / `write-failed …` / `carry-forward-skipped …` | 同 `digest` 各行的级别 | **旁挂写盘**（外来压缩机），事件名与字段和 `digest` 行一致，只换 scope |
+| `context-guard/sidecar: archived session=… compaction=… epoch=… messages=… raw=… digest=…` | info | 旁挂归档落盘完成（失败时为 `failed session=… error=…`，仍不抛） |
+| `context-guard/sidecar: skipped reason=no-cwd\|empty-region session=…` | warn | 会话无 `cwd`（写 `.handoff` 会落到宿主进程的工作目录）或区间取不到消息 |
 
 ## 行为语义 / Behavior
 
@@ -237,6 +265,8 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
   agent 拉起来。
 - **并发安全**：`compacting` 标记防止同一会话的并发压缩；压缩信号在插件卸载时中止。
 - **写盘原子性**：tmp + `rename`；顺序 raw → `latest.txt` → digest → `latest-digest.txt`，指针最后移动。
+- **旁挂序号与收尾笔记同源**：`N = ` 本会话（含手动）压缩总数 `+ 1`。写盘时 `compaction/end` 还没追加，
+  所以这个数与收尾提示里的 `{{epoch}}`、以及盘上已有的最大编号（取较大者）一致，不会重号。
 
 ## 模型体验 / Model Experience
 
@@ -262,9 +292,10 @@ npm run verify      # 三者全跑
 
 测试套件（`tests/`）通过真实 agent loop 驱动脚本化 mock adapter，覆盖完整闭环（提醒 → 收尾 → 空闲
 压缩 → 续跑）、阈值以下无动作、已收尾步骤不提醒、失败压缩不续跑、每个配置开关、每周期一次防循环
-语义，以及新增模块的纯函数契约：摘要抽取/预算梯度/继承与版本失配（`digest.spec.ts`）、落点与目录名
+语义、**旁挂归档**（外来后端写 raw+digest 并被续跑提示引用、跨次编号与继承、自家引擎不重复写），
+以及新增模块的纯函数契约：摘要抽取/预算梯度/继承与版本失配（`digest.spec.ts`）、落点与目录名
 清洗（`paths.spec.ts`）、分级续跑决策（`resume-prompt.spec.ts`）、会话事实读取（`session-facts.spec.ts`）、
-设置解析与优先级（`settings.spec.ts`）。
+设置解析与优先级（`settings.spec.ts`）、共用写盘器与 `minEpoch` 编号（`archive.spec.ts`）。
 
 ## 已知限制 / Known Limitations
 
@@ -280,6 +311,11 @@ npm run verify      # 三者全跑
   根目录不再增长。
 - 接力笔记的目录由守卫按 `<cwd>/.handoff` 默认基线 + settings 的 `archiveLayout` 算出；
   若压缩引擎行单独配了别的 `archiveDir`（不在 settings 命名空间里），笔记与归档会分处两地。
+  **旁挂归档同理**：它读 settings 的 `archiveLayout`，读不到引擎行的 `archiveDir`/`epochPrefix`。
+- 只归档**摘要式压缩**（`compaction/summary`）。同族里模型无关的 `compaction/prune` 不写归档 ——
+  它是纯剪枝、没有摘要区间，混进同一套 `epoch-N` 编号会让 digest 与序号错位。
+- 会话没有 `cwd` 时不旁挂写盘（`.handoff` 会相对宿主进程的工作目录解析），只记一行
+  `sidecar: skipped reason=no-cwd`。
 - digest 含用户文本与路径：父仓库 `.gitignore` 已 ignore `.handoff/sessions/`。
 - 同一会话的并发压缩靠 guard 的 `compacting` 标记串行化；跨进程并发写同一会话仍未加文件锁。
 
