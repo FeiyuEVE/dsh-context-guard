@@ -4,6 +4,19 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.4.4] - 2026-09-14
+
+### 兼容性
+
+- 声明兼容 dsh `0.1.5-rc.2-local.5`（与上游基线 `0.1.5-rc.2` 相同，仅本地补丁号 +1，上游兼容面未变）。
+- 7 个 `@deepseek-ai/dsh-*` 依赖（`dsh-agent` / `dsh-compaction` / `dsh-compaction-basic` / `dsh-llm` / `dsh-session` / `dsh-token-meter` / `dsh-settings`）的 `peerDependencies` 列表末尾追加 `|| 0.1.5-rc.2-local.5`，保持显式列表风格。
+- **只做版本适配，功能零改动**（`src/`、`scripts/`、`cordis.patch.yml` 均未触碰）。
+
+### 验证
+
+- 兼容性验证口径：本仓库无 `scripts/check-dsh-compatibility.mjs`；以「链接场实测版本对账」代替 —— `node_modules/@deepseek-ai/*`（经 `pnpm-workspace.yaml` 的 `overrides` link 到 `../deepseek-harness/` 源码）7 个包实际版本均为 `0.1.5-rc.2-local.5`，且逐条落在新声明的 `peerDependencies` 范围内。
+- `npm run verify`（typecheck + vitest + tsdown/esbuild 构建）退出 0。
+
 ## [0.4.3] - 2026-09-12
 
 ### 修复
