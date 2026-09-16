@@ -4,6 +4,14 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.4.5] - 2026-09-16
+
+### 兼容性
+
+- 声明兼容 dsh `0.1.6-alpha.1` 与本地发布线 `0.1.6-alpha.1-local.1`:7 个 `@deepseek-ai/dsh-*` 依赖的 `peerDependencies` 列表末尾各追加这两个版本号,保持显式列表风格。
+- **只做版本适配,功能零改动**(`src/`、`scripts/`、`cordis.patch.yml` 均未触碰)。0.1.6 下契约核实结果:`compaction/compaction/src/types.ts` 与 `0.1.5-rc.2` diff 为空、`summarize()` 仍是唯一官方扩展点、「同步落盘先于替换」不变量未变;settings 与 `ui-settings` slot 契约源码零改动;守卫不订阅 `agent/session-start`(0.1.6 已删除该事件)。
+- 记债(不在本版处理):`session.snapshotEvents()` / `eventAt()` 在 0.1.6 起标记 `@deprecated`(仍保留实现,运行期不崩),上游 policy 允许既有调用延后迁移;迁移需单独立项。
+
 ## [0.4.4] - 2026-09-14
 
 ### 兼容性
