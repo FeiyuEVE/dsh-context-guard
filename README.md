@@ -33,7 +33,11 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
    `compaction.compactNow()`（引擎解析见 §[容错设计](#容错设计)），每个超阈值周期只压缩一次
    （防止压缩-续跑死循环）。
 3. **hook `compaction/end`** —— 压缩成功（无 `error`）且 agent 空闲时，**按压缩频率分级**渲染续跑
-   提示并 `followup()` 唤醒，在压缩后的表层上续跑。失败、agent 运行中、或频率超上限时按规则不唤醒。
+   提示并唤醒，在压缩后的表层上续跑。失败、agent 运行中、或频率超上限时按规则不唤醒。
+   **通道由「谁拥有这一轮」决定**：会话没有在续跑的 goal 时用 `followup()`（进 `next-turn`，守卫自己
+   开轮）；`next-turn` 已被 goal round 占住、或 `goals` 视图报告 goal `armed`+`active` 时改用 `steer()`
+   （进下一步，与 goal round 落在**同一个 step**，永不与它争同一个格子）；L3 抑制时用 `inject()`
+   （同通道、不唤醒）。
 4. **hook `compaction/summary`（旁挂归档）** —— 压缩由**别人**执行时（`standard` preset 的
    `compaction-basic`、手动 `/compact`），守卫把被遮蔽的区间取回来，按同一格式补写
    `epoch-N.digest.md`（`epoch-N.raw.md` 全文归档默认关闭，见下）。**模型看到的 checkpoint 完全由
@@ -103,7 +107,7 @@ settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置�
 | `L0` | 窗口内 ≤1 次（或关闭分级） | 基础模板（含摘要路径，及开启时的 raw 路径） |
 | `L1` | 窗口内 =2 次 | 追加「改为增量推进：只读确需片段、结论写进 todo_write」 |
 | `L2` | 窗口内 ≥3 次 | 追加「先拆分再继续」：会话**确实**带 `subagent`/`subagent_fork`/`workflow`/`ralph` 时点名委派，否则给「按需取片」方案 |
-| `L3` | 窗口内 ≥`resumeMaxPerWindow`（默认 5） | **不唤醒**：只留一条 `next-turn` 提示（「本次不再自动续跑」），归档与摘要照常落盘 |
+| `L3` | 窗口内 ≥`resumeMaxPerWindow`（默认 5） | **不唤醒**：只留一条提示（「本次不再自动续跑」；无 goal 时排 `next-turn`，有 goal 时放下一步），归档与摘要照常落盘 |
 
 - 窗口默认 30 分钟，**窗口内出现新的人类消息会重新计数**（只统计 `sourceCommandId === undefined`
   的自动压缩，手动 `/compact` 不计入）。
@@ -258,8 +262,8 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
 | `context-guard: idle-compacted agent=… tokens=… threshold=… ratio=… window=… shadowed=…` | info | hook 2 压缩成功 |
 | `context-guard: idle-compaction-failed agent=… error=…` | warn | hook 2 压缩抛错 |
 | `context-guard/resume: skipped reason=compaction-error error=…` | warn | 压缩带 error，不续跑 |
-| `context-guard/resume: sent agent=… compaction=… inWindow=… level=… digest=… promptTokens=…` | info | 续跑已注入并唤醒 |
-| `context-guard/resume: suppressed agent=… compaction=… inWindow=… window=…` | warn | L3：不唤醒，只留提示 |
+| `context-guard/resume: sent agent=… compaction=… inWindow=… level=… digest=… promptTokens=… owner=…` | info | 续跑已注入并唤醒（`owner` 空=守卫自己开轮 `followup`；`inbox`/`goal`=让给 goal round，走 `steer`） |
+| `context-guard/resume: suppressed agent=… compaction=… inWindow=… window=… owner=…` | warn | L3：不唤醒，只留提示（`owner` 非空时放下一步） |
 | `context-guard/resume: failed agent=… error=…` | warn | 续跑渲染/注入异常 |
 | `context-guard/digest: knobs source=settings\|config\|default enabled=… maxTokens=… targetRatio=… carryForward=… estimator=… writeRaw=… rawExcludeInjected=… layout=…` | info | 生效配置**变化时**记一次（含来源） |
 | `context-guard/digest: raw-written epoch=… session=… layout=… messages=… dir=… file=…` | info | 全文归档已落盘（仅在 `writeRawArchive` 开启时出现） |
@@ -282,8 +286,12 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
   请求必达；工具结果不经过 inbox（由日志派生模型历史），工具延续步骤的进入批次可能为空，此时提醒
   单独作为该步骤的进入消息。
 - **压缩失败**：`compaction/end` 带 `error` 时不续跑，仅记日志。
-- **L3 只排队不唤醒**：用 `agent.send(msg, 'next-turn', false)` 而非 `followup()`，避免在被抑制时仍把
-  agent 拉起来。
+- **不与 goal round 争 `next-turn`**（0.4.6 起）：`next-turn` 是「申请一轮」的通道，goal driver 把落在那里的
+  任何外来消息读成竞争提示 —— 它会把已排队的 round 标 `stale`，循环于是开一轮又被自己的 pre-step 拒掉
+  （`turn/end reason=blocked`），round 再被重排到那条消息**后面**。守卫只在**没有** goal 拥有这一轮时写
+  `next-turn`；有 goal 时续跑提示走 `steer`/`inject`（下一步通道），与 goal round 同处一个 step。
+- **L3 只排队不唤醒**：用不唤醒的通道（无 goal 时 `agent.send(msg, 'next-turn', false)`，有 goal 时
+  `agent.inject(msg)`），避免在被抑制时仍把 agent 拉起来。
 - **并发安全**：`compacting` 标记防止同一会话的并发压缩；压缩信号在插件卸载时中止。
 - **写盘原子性**：tmp + `rename`；顺序（开启 raw 时）raw → `latest.txt` → digest → `latest-digest.txt`，
   指针最后移动；默认只走 digest → `latest-digest.txt` 两步。
@@ -328,6 +336,12 @@ npm run verify      # 三者全跑
   位于 `isolate` realm，host 行只能经 seam 访问。
 - `step/end` 评估依赖 `session.requestHeader()` 与模型适配器声明的 `contextWindow`；无请求头或模型未
   声明窗口时会话被跳过。
+- **goal 归属判据有两个来源**：`next-turn` 里已排队的 goal round（不需要服务，composition 把
+  `dsh-goal` 挂在 preset 的 `isolate` realm 里时这是唯一可见信号），以及 `ctx.get('goals')` 的 live 视图
+  （`phase==='active' && activation==='armed' && roundsStarted < maxGoalRounds`；`activation` 是进程内的，
+  会话日志里没有）。两者都读不到时守卫退回 `followup()` —— 即 0.4.5 及以前的行为，不会更糟。
+  goal 处于 paused / blocked / complete / disarmed / 轮次用尽时**不算**拥有这一轮，守卫照常自己唤醒，
+  否则「goal 停了，会话也跟着停住」。
 - 收尾是「提示性停止」：通过提醒引导 agent 自行收尾停轮，不强制中断轮次。
 - digest 是**事实清单而非语义摘要**：它不试图理解内容，模型需要推理脉络时仍要 `read` 完整归档。
 - `.handoff/` 根下 299 份历史 flat 归档**不迁移**（无法按会话归属），新版不再写根 `latest.txt`。

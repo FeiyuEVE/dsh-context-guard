@@ -194,6 +194,39 @@
   不还原 splice 会**完全丢掉真人请求**（实测 155 → 354 条消息，`intents` 从 `[]` 变回有人话）。
   重放脚本用完即删（依赖本机会话日志，不进仓库），只留输出证据。
 
+## 续跑注入通道与 goal
+
+- **`next-turn` 是「申请一轮」的通道，不是「投递内容」的通道**（0.4.6 修复的线上事故）。核心
+  `ReactLoopInbox.claim('next-turn')` 领走**全部 `next-step` + 恰好一个 `next-turn`**，所以
+  `next-turn` 的每一格就是「一轮」；`next-step` 才是「搭下一步的车」。实测口径：一条 8 个 goal round
+  的会话里，非人类、非 goal 却落进 `next-turn` 的消息**只有 1 条** —— 就是守卫用 `followup()`
+  （= `send(msg, 'next-turn', true)`）发的续跑提示。同一会话里 `agent-instructions`（AGENTS.md）6 次、
+  `tool-jobs` 通知 4 次、`agent-message`/`subagent-settled` 17 次，全部走 `next-step`，所以它们
+  **从不被抢占**：`RuntimeContextProjection` 与 `agent/inject` 都不进 `next-turn`。
+- **落进 `next-turn` 的代价不止是排队**：`goal-round-driver` 的 `agent/inbox/inserted` 只看
+  `inbox.nextTurn`，发现外来消息就置 `competingQueued`，并把仍在 `queued` 相的自己的 round 标
+  `stale`；随后循环开的那一轮被 driver 自己的 `agent/pre-step` 判为失效 reservation → 返回
+  `{kind:'reject'}` → 循环记 `turn/end reason=blocked`（**空转一轮**）→ 拒绝路径把 round 重新
+  `followup()` 成**队尾**，于是它稳定地排到那条外来消息后面。线上 `session-6178b6e6` 逐 seq 证据：
+  `1293` goal round 入 `next-turn[0]` → `1297` 守卫提示入 `next-turn[1]` → `1299` 领走 round →
+  `1300` `turn/end blocked` → `1301` round 重排到 `[1]` → `1303` 领走守卫提示。
+- **修法（0.4.6）**：只在**没有 goal 拥有这一轮**时才用 `followup()`；有 goal 时续跑提示走
+  `agent.steer()`（`send(msg, 'next-step', true)`，同 step、不争格子），L3 抑制走 `agent.inject()`
+  （`send(msg, 'next-step', false)`，不唤醒）。判据是 `goalTurnOwner()` 的两层观察：inbox 里已排队的
+  goal round（不需要服务；composition 把 `dsh-goal` 挂在 preset `isolate` realm 时这是 host 半边
+  **唯一**可见的信号）+ `ctx.get('goals')` 的 live 视图。
+- **`activation` 只能 live 读**：`goal.phase` 是持久的（会话日志里有），`activation: armed|disarmed`
+  是**进程内**的（`packages/goal/goal/src/types.ts` 明说 "process-local and separate"），所以判「goal
+  会不会自己产生下一轮」不能读日志，只能读服务。两者都读不到时退回 `followup()`，即旧行为。
+- **不要过度纠正**：goal 处于 paused / blocked / complete / disarmed / 轮次用尽时**不拥有**这一轮，
+  守卫必须保留自己的唤醒 —— 自动压缩发生在 `agent/status idle`，这一轮本来没有别的 owner；把续跑
+  整个改成「只折叠、永不唤醒」，会让「压缩后续跑」这个功能本身失效。分界线只有一条：**这一轮有没有
+  别的 owner**。
+- **测试陷阱**：在 `session/event` 监听器里 `agent.send()` 会**静默失效** —— 它是对 append 派发的
+  重入（守卫自己的 `resumeAfter` 之所以走 `queueMicrotask` 就是这个原因）。测试里要复现「driver 在
+  压缩期排 round」，必须在监听器里 `queueMicrotask(() => agent.send(...))`，否则消息根本进不去
+  inbox（实测症状：`agent/inbox/spliced` 里完全没有那次插入）。
+
 ## 日志
 
 - **字段不含正文**：只有路径、计数、名称；`context-guard: knobs source=settings|config|default` 是排查

@@ -11,8 +11,11 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
    时，把收尾提醒排队，经 `agent/pre-step` 折叠进下一步进入消息；同一超阈值周期只提醒一次。
 2. `agent/status` idle：仍超阈值则 `compaction.compactNow()`；同一超阈值周期只压缩一次
    （防压缩-续跑死循环）。
-3. `compaction/end`：压缩无 `error`、开关开启且 agent 空闲时，按 **L0–L3 分级**渲染续跑提示并
-   `agent.followup()`；L3 只 `agent.send(..., 'next-turn', false)` 排队不唤醒。
+3. `compaction/end`：压缩无 `error`、开关开启且 agent 空闲时，按 **L0–L3 分级**渲染续跑提示并注入。
+   通道按「谁拥有这一轮」选：**无 goal** → `agent.followup()`（`next-turn`，守卫开轮）；**有 goal**
+   （`next-turn` 已排 goal round，或 `goals` 视图 armed+active 且未到轮次上限）→ `agent.steer()`
+   （下一步通道，与 goal round 同 step）；**L3 抑制** → 不唤醒的对应通道（`agent.send(…, 'next-turn',
+   false)` / `agent.inject()`）。判据见 `goalTurnOwner()`。
 4. `compaction/summary`（**旁挂归档**）：压缩由别的引擎执行（`provider !== 'context-guard'`，即
    `standard` preset 的 `compaction-basic` 或手动 `/compact`）时，守卫按 `shadowedSeqs` 取回区间，
    自己写 `digest`（`raw` 全文归档默认关闭，见「关键约定」）。**不接管 dsh 的压缩执行** —— 不覆写
@@ -123,6 +126,14 @@ npm run verify      # typecheck && test && build（顺序固定）
   代价是归档盘卡住会拖住压缩调用方。回归用例见 `tests/context-guard.spec.ts` 的
   `lands the archive before the replacing message is dispatched`；路径只能靠续跑提示进上下文这一点
   仍是已知弱化。详见 `docs/gotchas.md`。
+- **绝不与 goal round 争 `next-turn`**（0.4.6 起）：goal driver 把 `next-turn` 上**任何**外来消息读成竞争
+  提示 —— 它会把已排队的 round 标 `stale`，循环于是开一轮又被自己的 pre-step 拒掉
+  （`turn/end reason=blocked`），round 再被重排到那条消息**后面**。判据见 `src/index.ts` 的
+  `goalTurnOwner()`：inbox 观察优先（composition 把 `dsh-goal` 挂在 preset `isolate` realm 时，这是
+  host 半边唯一可见的信号），`goals` 服务的 live 视图次之（`activation` 是进程内的，日志里读不到）；
+  两者都读不到时退回 `followup()`。回归用例见 `tests/context-guard.spec.ts` 的
+  `goal-owned post-compaction continuation`（把通道改回 `followup()` 该组会挂 3 条），教训见
+  `docs/gotchas.md`「续跑注入通道与 goal」。
 - **日志一律走 `createLogSink`**（`ctx.logger` + console 双投递），字段不含正文。
 - **配置优先级处处一致**：`settings 用户层 > 组合 config > 内置默认`；解析结果含空字符串都必须照用。
 

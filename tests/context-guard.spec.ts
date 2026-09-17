@@ -88,6 +88,17 @@ function fakeSettings(initial: ThresholdSettingsValue & Record<string, unknown>)
 }
 
 /**
+ * The ownership fields a fake `goals` provider reports, as the guard reads them.
+ * Round fields default to "plenty left", so a test states only what it means.
+ */
+type GoalViewLike = {
+  phase: string
+  activation: string
+  roundsStarted?: number
+  maxGoalRounds?: number
+}
+
+/**
  * Boot the core spine, the stub compaction backend, and the guard with a
  * scripted mock adapter, and start one over-threshold turn.
  * @param presets - optional seam factory: receives the harness context and
@@ -98,6 +109,8 @@ function fakeSettings(initial: ThresholdSettingsValue & Record<string, unknown>)
  *   side-car writer archives (`<cwd>/.handoff`). Without one the session has
  *   no resolvable archive base, exactly like a session created outside any
  *   workspace.
+ * @param goals - the live goal view the guard reads through `ctx.get('goals')`;
+ *   absent means "this composition mounts no goal service".
  */
 async function harness(
   script: ScriptEntry[],
@@ -107,6 +120,7 @@ async function harness(
   settings?: ReturnType<typeof fakeSettings>,
   presets?: (ctx: Context) => { serviceFor(agent: { ctx: Context }, name: string): unknown } | undefined,
   cwd?: string,
+  goals?: GoalViewLike,
 ): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine | undefined; adapter: MockAdapter }> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
@@ -114,6 +128,15 @@ async function harness(
   settings?.provide(ctx)
   const presetsValue = presets?.(ctx)
   if (presetsValue !== undefined) ctx.provide('agentPresets', presetsValue as never)
+  if (goals !== undefined) {
+    const view = {
+      phase: goals.phase,
+      activation: goals.activation,
+      roundsStarted: goals.roundsStarted ?? 0,
+      maxGoalRounds: goals.maxGoalRounds ?? 30,
+    }
+    ctx.provide('goals', { get: () => view } as never)
+  }
   const compaction = withCompaction ? new StubCompactionEngine(ctx) : undefined
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(ContextGuard, config)
@@ -158,6 +181,70 @@ function turnsEnded(agent: Agent): number {
 
 function compactionEndCount(agent: Agent): number {
   return agent.session.snapshotEvents().filter(e => e.type === 'compaction/end').length
+}
+
+/**
+ * Context-guard messages inserted on the `next-turn` boundary.
+ *
+ * That boundary is where a goal round is reserved, and the goal driver reads a
+ * foreign message landing there as a competing prompt — it marks its own queued
+ * round stale, the loop then rejects the round's step (`turn/end` `blocked`), and
+ * the round is re-queued behind the insert. This must stay empty whenever a goal
+ * owns the turn.
+ */
+function nextTurnGuardInserts(agent: Agent): string[] {
+  return [...agent.session.snapshotEvents()]
+    .filter((e): e is SessionEvent<'agent/inbox/spliced'> => e.type === 'agent/inbox/spliced')
+    .filter(e => e.data.target === 'next-turn')
+    .flatMap(e => e.data.inserted)
+    .filter(m => m.source.kind === 'plugin' && m.source.plugin === 'context-guard')
+    .map(m => m.id)
+}
+
+/** Turns the loop opened only to reject their claimed batch. */
+function blockedTurns(agent: Agent): number {
+  return agent.session.snapshotEvents()
+    .filter(e => e.type === 'turn/end' && e.data.reason.kind === 'blocked')
+    .length
+}
+
+/** Seqs of admitted goal-round messages, in log order. */
+function goalRoundSeqs(agent: Agent): number[] {
+  return [...agent.session.snapshotEvents()]
+    .filter((e): e is SessionEvent<'user/message'> => e.type === 'user/message')
+    .filter(e => String((e.data.source as { kind?: unknown }).kind) === 'goal')
+    .map(e => e.seq)
+}
+
+/** `turn/step` of the step boundary that admitted a message, for same-step checks. */
+function stepOf(agent: Agent, seq: number): string | undefined {
+  const boundary = [...agent.session.snapshotEvents()]
+    .filter(e => e.type === 'step/start' && e.seq < seq)
+    .at(-1)
+  return boundary === undefined || boundary.type !== 'step/start'
+    ? undefined
+    : `${boundary.data.turn}/${boundary.data.step}`
+}
+
+/**
+ * Reserve one goal round on `next-turn` while the next compaction is in flight.
+ *
+ * This is when the real driver does it: it reacts to the same idle transition
+ * that starts the compaction, so its round is already queued well before the
+ * compaction ends. The splice is deferred out of the append dispatch, because a
+ * session-event listener that appends reenters that publication — the same
+ * reason the guard's own resume runs in a microtask.
+ */
+function reserveGoalRoundOnCompaction(ctx: Context, agent: Agent, round = 1): void {
+  ctx.on('session/event', (session, event) => {
+    if (event.type !== 'compaction/start' || session !== agent.session) return
+    queueMicrotask(() => {
+      agent.send(createUserMessage({
+        content: [{ type: 'text', text: `<goal_round>Round: ${round}/30</goal_round>` }],
+        source: { kind: 'goal', goalId: 'goal-t', revision: 1, round } as never,
+      }), 'next-turn', false)
+    })
+  })
 }
 
 describe('context-guard full loop', () => {
@@ -436,6 +523,112 @@ describe('resume escalation', () => {
     expect(afterSecond[1]!.text).toContain('已自动压缩 2 次')
     // The deferred resume still lands, and the session settles.
     expect(agent.status).toBe('idle')
+    void ctx
+  })
+})
+
+describe('goal-owned post-compaction continuation', () => {
+  it('an armed goal owns the turn: the continuation takes the step channel, not next-turn', async () => {
+    const { ctx, agent, compaction } = await harness(
+      [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('wrapping up now'), textResponse('goal work')],
+      {},
+      300,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      { phase: 'active', activation: 'armed' },
+    )
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+
+    expect(compaction!.compactNowCalls).toEqual([1])
+    // The continuation still lands on the compacted surface...
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(2)
+    expect(messages[1]!.text).toContain('继续')
+    // ...but never on the boundary the goal round is reserved on.
+    expect(nextTurnGuardInserts(agent)).toEqual([])
+    expect(blockedTurns(agent)).toBe(0)
+    void ctx
+  })
+
+  it('a reserved goal round and the continuation enter the same step', async () => {
+    // No `goals` service at all: this is the realm-isolate topology, where the
+    // reservation itself is the only observable signal.
+    const { ctx, agent } = await harness(
+      [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('wrapping up now'), textResponse('goal work')],
+    )
+    reserveGoalRoundOnCompaction(ctx, agent)
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+
+    const goalSeq = goalRoundSeqs(agent)
+    expect(goalSeq).toHaveLength(1)
+    // Match the continuation by its own opening, not by '继续': the wrap-up
+    // reminder also contains that word.
+    const resume = guardMessages(agent).find(m => m.text.startsWith('上下文已压缩'))
+    expect(resume).toBeDefined()
+    // One turn, one request: the round stays valid and the handoff pointer rides
+    // along instead of competing for the round's own turn.
+    expect(stepOf(agent, goalSeq[0]!)).toBe(stepOf(agent, resume!.seq))
+    expect(nextTurnGuardInserts(agent)).toEqual([])
+    expect(blockedTurns(agent)).toBe(0)
+    void ctx
+  })
+
+  it('a goal that no longer owns the turn leaves the wake-up to the guard', async () => {
+    const nonOwning: GoalViewLike[] = [
+      { phase: 'paused', activation: 'armed' },
+      { phase: 'active', activation: 'disarmed' },
+      { phase: 'blocked', activation: 'disarmed' },
+      { phase: 'complete', activation: 'armed' },
+      { phase: 'active', activation: 'armed', roundsStarted: 30, maxGoalRounds: 30 },
+    ]
+    for (const goals of nonOwning) {
+      const { ctx, agent } = await harness(
+        [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('wrapping up now'), textResponse('continuing')],
+        {},
+        300,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        goals,
+      )
+      await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+      // Nothing else will resume this session, so the guard keeps its own
+      // wake-up — and with it the `next-turn` boundary no goal round holds.
+      expect(nextTurnGuardInserts(agent)).toHaveLength(1)
+      expect(blockedTurns(agent)).toBe(0)
+      void ctx
+    }
+  })
+
+  it('a held resume neither wakes a goal-owned turn nor takes its boundary', async () => {
+    const { ctx, agent } = await harness(
+      [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('wrapping up now')],
+      {},
+      300,
+      true,
+      fakeSettings({
+        defaultThresholdTokens: 0,
+        providerThresholds: [],
+        resumeMaxPerWindow: 1,
+        resumeWindowMinutes: 30,
+      }),
+      undefined,
+      undefined,
+      { phase: 'active', activation: 'armed' },
+    )
+    await vi.waitFor(() => { expect(compactionEndCount(agent)).toBe(1) })
+    // Held work parks as step context for whichever turn opens next...
+    await vi.waitFor(() => {
+      expect(agent.inbox.nextStep.some(m =>
+        m.source.kind === 'plugin' && m.source.plugin === 'context-guard')).toBe(true)
+    })
+    // ...so it neither takes the goal's boundary nor wakes the agent itself.
+    expect(nextTurnGuardInserts(agent)).toEqual([])
+    expect(turnsEnded(agent)).toBe(1)
+    expect(guardMessages(agent)).toHaveLength(1)
     void ctx
   })
 })

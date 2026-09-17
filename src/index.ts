@@ -18,7 +18,13 @@
  *    are reachable from this host-mounted guard.
  * 3. `compaction/end` — after a successful compaction of an idle agent, the
  *    guard queues a continuation prompt and wakes the driver, so the task
- *    resumes on the compacted surface instead of sitting idle.
+ *    resumes on the compacted surface instead of sitting idle. When an
+ *    automatic goal round already owns that turn, the prompt is delivered as
+ *    step context (`steer`, or `inject` when the resume is being held) rather
+ *    than as a competing `next-turn` follow-up: the goal driver reads a foreign
+ *    message on that boundary as a rival prompt and invalidates its own
+ *    reserved round, which burns a rejected turn and re-queues the round behind
+ *    the guard.
  * 4. `compaction/summary` — for a compaction some *other* backend ran (the
  *    `standard` preset's `compaction-basic`, a manual `/compact`), the guard
  *    writes the deterministic `raw` + `digest` pair beside that backend's
@@ -189,6 +195,47 @@ interface PresetServiceSeam {
   serviceFor<K extends string & keyof Context>(agent: { ctx: Context }, name: K): Context[K] | undefined
 }
 
+/**
+ * The one `goals` seam method the guard reads. Read through `ctx.get` because
+ * the goal service is optional: a composition may mount no goal plugin at all,
+ * and this plugin declares no dependency on the package that provides it, so
+ * the read is untyped at the seam and narrowed to the fields used below.
+ */
+interface GoalSeam {
+  get(agent: Agent): GoalOwnership | undefined
+}
+
+/** The ownership-relevant fields of one live goal view. */
+interface GoalOwnership {
+  /** Durable lifecycle phase: `active` while the goal may still continue. */
+  phase: string
+  /** Process-local continuation switch; carried by the live view only. */
+  activation: string
+  /** Rounds already started. */
+  roundsStarted: number
+  /** Configured round limit. */
+  maxGoalRounds: number
+}
+
+/**
+ * The round number of an automatic goal-round message, or undefined for every
+ * other source.
+ *
+ * `MessageSourceMap` is merge-extensible and this plugin deliberately does not
+ * depend on the package that declares `goal`, so the discriminator is compared
+ * as a plain string — unknown kinds fall through, which is the documented way to
+ * read that map — and the round is read structurally.
+ *
+ * Only a positive round counts: the driver reserves rounds that way, while a
+ * round-0 source is the create/edit provenance of the goal itself.
+ */
+function goalRound(source: UserMessage['source']): number | undefined {
+  const kind: string = source.kind
+  if (kind !== 'goal') return undefined
+  const round = (source as { round?: unknown }).round
+  return typeof round === 'number' && round > 0 ? round : undefined
+}
+
 /** One session's over-threshold episode state; entries are GC'd with the session. */
 interface EpisodeState {
   /** A wrap-up reminder was queued this episode. */
@@ -336,6 +383,40 @@ export function apply(ctx: Context, config: Config = {}): void {
   /** A `notice`-form plugin source carrying one one-line account. */
   function pluginSource(summary: string): { kind: 'plugin'; plugin: 'context-guard'; form: 'notice'; summary: string } {
     return { ...PLUGIN_SOURCE, form: 'notice', summary }
+  }
+
+  /**
+   * Which observation says an automatic goal round owns this agent's next turn,
+   * or undefined when the guard owns it.
+   *
+   * `next-turn` is the boundary a goal round is reserved on, and the goal driver
+   * treats *any* foreign message inserted there as a competing prompt: it marks
+   * its own queued round stale, the loop then opens a turn whose pre-step
+   * rejects that round (`turn/end` reason `blocked`), and the round is re-queued
+   * behind the insert. The guard therefore must not write to that boundary while
+   * a goal owns it — the continuation goes to the step channel instead.
+   *
+   * Two independent observations, either one sufficient:
+   *
+   * 1. `inbox` — the round is already reserved. This needs no service lookup,
+   *    and it is the only signal available when a composition mounts the goal
+   *    service behind a preset's `isolate` realm, where this host fiber cannot
+   *    read it.
+   * 2. `goal` — the live view reports an armed, active goal with rounds left,
+   *    the exact state in which the driver will produce that round.
+   *    `activation` is process-local, so only the live view carries it.
+   *
+   * A paused, blocked, completed, disarmed, or round-exhausted goal owns
+   * nothing: the guard keeps its own wake-up, which is what resumes a session
+   * whose goal stopped on its own.
+   */
+  function goalTurnOwner(agent: Agent): 'inbox' | 'goal' | undefined {
+    if (agent.inbox.nextTurn.some(message => goalRound(message.source) !== undefined)) return 'inbox'
+    const goal = (ctx.get('goals') as GoalSeam | undefined)?.get(agent)
+    if (goal === undefined) return undefined
+    if (goal.phase !== 'active' || goal.activation !== 'armed') return undefined
+    if (goal.roundsStarted >= goal.maxGoalRounds) return undefined
+    return 'goal'
   }
 
   /**
@@ -678,23 +759,39 @@ export function apply(ctx: Context, config: Config = {}): void {
         delegationTools: delegation,
       }, { escalation: resolved.resumeEscalation })
       const promptTokens = estimateTextTokens(decision.prompt, resolved.digestTokenEstimator)
+      // Read as late as possible: the goal driver reserves its round while the
+      // compaction is in flight, so the inbox observation is normally already
+      // true here.
+      const owner = goalTurnOwner(agent)
+      const message = createUserMessage({
+        content: [{ type: 'text', text: decision.prompt }],
+        source: pluginSource(decision.suppress ? RESUME_HOLD_SUMMARY : RESUME_SUMMARY),
+      })
       if (decision.suppress) {
         logWarn(log, 'resume', 'suppressed', {
           agent: agent.id,
           compaction: pace.sessionTotal,
           inWindow: pace.autoInWindow,
           window: resolved.resumeWindowMinutes,
+          owner: owner ?? '',
         })
-        agent.send(createUserMessage({
-          content: [{ type: 'text', text: decision.prompt }],
-          source: pluginSource(RESUME_HOLD_SUMMARY),
-        }), 'next-turn', false)
+        // Held work must not wake the agent either. On the step channel it waits
+        // for whichever turn opens next — the goal's own, when one is reserved —
+        // instead of taking the boundary that round lives on.
+        if (owner === undefined) agent.send(message, 'next-turn', false)
+        else agent.inject(message)
         return
       }
-      agent.followup(createUserMessage({
-        content: [{ type: 'text', text: decision.prompt }],
-        source: pluginSource(RESUME_SUMMARY),
-      }))
+      if (owner === undefined) {
+        agent.followup(message)
+      } else {
+        // `steer` lands in the next step, never on the `next-turn` boundary a
+        // goal round is reserved on, so the round stays valid and both enter the
+        // same step of the same turn. The wake stays the guard's: a goal that
+        // stops between the check above and its own follow-up must not strand
+        // the session.
+        agent.steer(message)
+      }
       logInfo(log, 'resume', 'sent', {
         agent: agent.id,
         compaction: pace.sessionTotal,
@@ -702,6 +799,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         level: decision.level,
         digest: digestPath,
         promptTokens,
+        owner: owner ?? '',
       })
     } catch (error: unknown) {
       logWarn(log, 'resume', 'failed', { agent: agent.id, error: String(error) })

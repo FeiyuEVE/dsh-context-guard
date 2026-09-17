@@ -4,6 +4,45 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.4.6] - 2026-09-17
+
+### 修复
+
+- **不再与 goal round 争 `next-turn`：压缩续跑提示改用下一步通道，消灭「goal round 被判废 + 空转一轮 +
+  重排到提示后面」**。线上会话 `session-6178b6e6`（8 个 goal round、自动压缩 `eb56714f`）逐 seq 复现：
+  `1293` goal driver 在压缩期间把 round 7 排进 `next-turn[0]` → `1296 compaction/end` → `1297` 守卫用
+  `followup()` 把续跑提示排到 `next-turn[1]` → `1298` 开轮、`1299` 领走的是 round → `1300`
+  `turn/end reason=blocked`（driver 的 `agent/pre-step` 把已置 `stale` 的 reservation 判为失效）→
+  `1301` round 被重排到提示**后面** → `1303` 领走提示。
+  根因是**通道选错**：`next-turn` 在这套架构里的语义是「申请一轮」（`claim('next-turn')` 领走全部
+  `next-step` + 恰好一个 `next-turn`），而 goal driver 把该通道上的任何外来消息读成竞争提示；「只想让
+  模型看到的内容」在本仓库的惯例是走 `next-step` —— 同一会话里 `agent-instructions`（AGENTS.md）6 次、
+  `tool-jobs` 通知 4 次、`agent-message`/`subagent-settled` 17 次全部如此，因此从不被抢占。
+  现在按「谁拥有这一轮」选通道：**无 goal** → 保持 `followup()`（进 `next-turn`；自动压缩发生在
+  `agent/status idle`，这一轮本来没有别的 owner，不唤醒会话就停住）；**有 goal** → `agent.steer()`
+  （进 `next-step`，与 goal round 落在**同一个 step**、同一个请求）；**L3 抑制 + 有 goal** →
+  `agent.inject()`（同通道、不唤醒）。
+  归属判据 `goalTurnOwner()` 用两层观察：①`next-turn` 里已排队的 goal round（无需服务查找；
+  composition 把 `dsh-goal` 挂在 preset `isolate` realm 时，这是 host 半边**唯一**可见的信号）；
+  ②`ctx.get('goals')` 的 live 视图（`phase==='active' && activation==='armed' &&
+  roundsStarted < maxGoalRounds`；`activation` 是进程内的，会话日志里读不到）。两者都读不到时退回
+  `followup()`，即 0.4.5 及以前的行为，不会更糟。**goal 处于 paused / blocked / complete / disarmed /
+  轮次用尽时不拥有这一轮**，守卫照常自己唤醒，否则「goal 停了，会话也跟着停住」。
+- 不新增依赖（`goals` 经 `ctx.get` 读、缺失即降级，`MessageSourceMap` 的 `goal` 判别子按字符串比较）；
+  不改客户端半边、不改归档/digest 契约、不改任何 preset。`resume: sent` / `resume: suppressed` 两行日志
+  新增 `owner=` 字段（空 = 守卫自己开轮）。
+
+### 验证
+
+- `npm run verify`（typecheck + vitest + tsdown/esbuild）退出 0，**124 例 / 10 文件**（新增 4 例）。
+- **新用例会拒绝旧行为**：把通道改回无条件 `followup()`，`goal-owned post-compaction continuation`
+  一组 4 例挂 3 例（第 4 例「goal 不拥有时必须自己唤醒」是反向不变量，两种实现都通过）。
+- 4 例分别钉住：armed goal 时提示**不**进 `next-turn`（`nextTurnGuardInserts` 为空）且不再出现
+  `turn/end reason=blocked`；已排队的 goal round 与续跑提示落在同一个 `turn/step`（对 `step/start`
+  边界比对，覆盖 realm-isolate 下只有 inbox 信号的场景）；goal 处于 paused/disarmed/blocked/complete/
+  轮次用尽时守卫仍走 `followup()`；L3 抑制 + armed goal 时提示停在 `agent.inbox.nextStep`、不唤醒、
+  `turn/end` 计数不变。
+
 ## [0.4.5] - 2026-09-16
 
 ### 兼容性
