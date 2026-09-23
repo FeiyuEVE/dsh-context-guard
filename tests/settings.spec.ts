@@ -1,48 +1,65 @@
 /**
- * Settings suite: schema defaults, the shared resolution order
+ * Settings suite: the live-field schema defaults, the shared resolution order
  * (settings > composition config > built-in default), and the feature-detected
  * user-layer read the archive engine relies on.
  */
 
 import { describe, expect, it } from 'vitest'
-import type { ContextGuardSettingsValue } from '../src/settings.ts'
 import {
   SETTINGS_DEFAULTS,
   overridesOf,
   resolveDigestConfig,
-  settingsSchema,
   userLayerOf,
   withDefaults,
 } from '../src/settings.ts'
+import { Config } from '../src/index.ts'
+import { DEFAULT_RESUME_PROMPT, DEFAULT_WRAP_UP_PROMPT } from '../src/resume-prompt.ts'
 
-describe('settings schema', () => {
-  // schemastery's callable type is the *resolved* shape; an empty user section
-  // is valid input at runtime (every field has a default), which is exactly
-  // what a freshly created settings document looks like.
-  const resolveEmpty = (): ReturnType<typeof settingsSchema> => settingsSchema({} as ContextGuardSettingsValue)
+describe('settings fields', () => {
+  // The knobs are live fields of the guard row's own Config (a form *is* the
+  // profile entry's config in 0.1.7), so the defaults are read through the
+  // reference each field is parsed into.
+  const resolveEmpty = () => Config({})
 
   it('resolves an empty section to the built-in defaults', () => {
     const resolved = resolveEmpty()
-    expect(resolved.digestEnabled).toBe(true)
-    expect(resolved.digestMaxTokens).toBe(800)
-    expect(resolved.digestTargetRatio).toBe(0.45)
-    expect(resolved.digestCarryForward).toBe(true)
-    expect(resolved.digestTokenEstimator).toBe('cjk')
-    expect(resolved.rawExcludeInjected).toBe(false)
-    expect(resolved.archiveLayout).toBe('session')
-    expect(resolved.resumeEscalation).toBe(true)
-    expect(resolved.resumeWindowMinutes).toBe(30)
-    expect(resolved.resumeMaxPerWindow).toBe(5)
-    expect(resolved.defaultThresholdTokens).toBe(0)
-    expect(resolved.providerThresholds).toEqual([])
+    expect(resolved.digestEnabled.get()).toBe(true)
+    expect(resolved.digestMaxTokens.get()).toBe(800)
+    expect(resolved.digestTargetRatio.get()).toBe(0.45)
+    expect(resolved.digestCarryForward.get()).toBe(true)
+    expect(resolved.digestTokenEstimator.get()).toBe('cjk')
+    expect(resolved.rawExcludeInjected.get()).toBe(false)
+    expect(resolved.archiveLayout.get()).toBe('session')
+    expect(resolved.resumeEscalation.get()).toBe(true)
+    expect(resolved.resumeWindowMinutes.get()).toBe(30)
+    expect(resolved.resumeMaxPerWindow.get()).toBe(5)
+    expect(resolved.defaultThresholdTokens.get()).toBe(0)
+    expect(resolved.providerThresholds.get()).toEqual([])
+    expect(resolved.writeRawArchive.get()).toBe(false)
   })
 
   it('keeps the documented defaults in one place', () => {
-    expect(resolveEmpty()).toMatchObject({
+    const resolved = resolveEmpty()
+    expect({
+      digestMaxTokens: resolved.digestMaxTokens.get(),
+      resumeWindowMinutes: resolved.resumeWindowMinutes.get(),
+      resumeMaxPerWindow: resolved.resumeMaxPerWindow.get(),
+    }).toEqual({
       digestMaxTokens: SETTINGS_DEFAULTS.digestMaxTokens,
       resumeWindowMinutes: SETTINGS_DEFAULTS.resumeWindowMinutes,
       resumeMaxPerWindow: SETTINGS_DEFAULTS.resumeMaxPerWindow,
     })
+  })
+
+  it('leaves the two templates unset, so a composition text can still be reached', () => {
+    // No schema default on purpose: an unset template must fall through to the
+    // composition's own `resumePrompt` / `wrapUpPrompt` (those fields carry the
+    // built-in text), while an empty string stays empty = "injection off".
+    const resolved = resolveEmpty()
+    expect(resolved.resumePromptTemplate.get()).toBeUndefined()
+    expect(resolved.wrapUpPromptTemplate.get()).toBeUndefined()
+    expect(resolved.resumePrompt).toBe(DEFAULT_RESUME_PROMPT)
+    expect(resolved.wrapUpPrompt).toBe(DEFAULT_WRAP_UP_PROMPT)
   })
 })
 

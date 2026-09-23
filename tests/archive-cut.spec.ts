@@ -14,7 +14,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createToolResultMessage, createUserMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -57,23 +57,24 @@ function assistantWithTool(text: string, toolName: string, args: string): Messag
     role: 'assistant',
     content: [
       { type: 'text', text },
-      { type: 'tool-call', id: 'c1' as never, name: toolName, arguments: args },
+      { type: 'tool-call', id: ToolCallId('c1'), name: toolName, arguments: args },
     ],
   } as unknown as Message
 }
 
-/** One user message carrying a tool result. */
+/**
+ * One tool message carrying a tool result.
+ *
+ * V4 has no `tool-result` content block: the result is its own `role: 'tool'`
+ * message built by `createToolResultMessage`, with the outcome on the message
+ * (`isError`) instead of on a block.
+ */
 function toolResultMessage(isError: boolean, body: string): Message {
-  return {
-    role: 'user',
-    content: [{
-      type: 'tool-result',
-      toolCallId: 'c1' as never,
-      isError,
-      content: [{ type: 'text', text: body }],
-    }],
-    source: { kind: 'tool', callId: 'c1' as never },
-  } as unknown as Message
+  return createToolResultMessage({
+    callId: ToolCallId('c1'),
+    content: [{ type: 'text', text: body }],
+    isError,
+  })
 }
 
 describe('messagesToMarkdown (deterministic cleaner)', () => {
@@ -176,8 +177,7 @@ function guardMessages(agent: { session: { snapshotEvents(): readonly SessionEve
   return [...agent.session.snapshotEvents()]
     .filter((e): e is SessionEvent<'user/message'> =>
       e.type === 'user/message'
-      && e.data.source.kind === 'plugin'
-      && e.data.source.plugin === 'context-guard')
+      && e.data.source.kind === 'context-guard')
     .map(e => e.data.content.filter(b => b.type === 'text').map(b => b.text).join('|'))
 }
 

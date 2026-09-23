@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import { createToolResultMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import {
   DIGEST_FORMAT_VERSION,
@@ -38,18 +39,19 @@ function assistant(text: string, calls: { id: string; name: string; args: unknow
   } as unknown as Message
 }
 
-/** One user-role message carrying a tool result. */
+/**
+ * One tool message carrying a tool result.
+ *
+ * V4 (dsh 0.1.7) removed the `tool-result` content block: the result is its own
+ * `role: 'tool'` message, built by `createToolResultMessage`, which is exactly
+ * what the extractor reads.
+ */
 function toolResult(body: string, isError = false): Message {
-  return {
-    role: 'user',
-    content: [{
-      type: 'tool-result',
-      toolCallId: 'c1',
-      isError,
-      content: [{ type: 'text', text: body }],
-    }],
-    source: { kind: 'tool', callId: 'c1' },
-  } as unknown as Message
+  return createToolResultMessage({
+    callId: ToolCallId('c1'),
+    content: [{ type: 'text', text: body }],
+    isError,
+  })
 }
 
 /** A minimal meta block for composition. */
@@ -219,9 +221,10 @@ describe('extractFacts', () => {
     // and pushed the human's actual question to second place.
     const facts = extractFacts([
       user('重启了吗？怎么样？'),
+      // V4: `tool-jobs` declares its own kind instead of the removed catch-all
+      // `plugin` kind; the regex on the summary text stays as the second signal.
       user('background job bash-3 (bash: cd /w && sed s/a/b/ f.txt) finished [status: completed]', {
-        kind: 'plugin',
-        plugin: 'tool-jobs',
+        kind: 'tool-jobs',
         form: 'notice',
         summary: 'bash cd /w && sed s/a/b/ f.txt',
       }),
@@ -234,7 +237,9 @@ describe('extractFacts', () => {
       user('You are an AI agent powered by DeepSeek Harness.', { kind: 'agent-instructions', form: 'instructions' }),
       { role: 'system', content: [{ type: 'text', text: 'system prompt' }], source: { kind: 'system' } } as unknown as Message,
       user('skills catalog', { kind: 'skill-catalog' }),
-      user('本段历史已由 dsh-context-guard 确定性归档', { kind: 'plugin', plugin: 'compact' }),
+      // V4: a prior compaction frame is a message of its own kind, where 0.1.6
+      // stamped `{ kind: 'plugin', plugin: 'compact' }`.
+      user('本段历史已由 dsh-context-guard 确定性归档', { kind: 'compact-checkpoint', compactionId: 'cp1' }),
       user('真正的任务：检查部署'),
     ])
     expect(facts.intents).toEqual(['真正的任务：检查部署'])

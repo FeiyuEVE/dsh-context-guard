@@ -246,10 +246,16 @@ export class ArchiveCutEngine extends BasicCompactionEngine {
   }
 
   /**
-   * Effective digest knobs: the settings user layer, else this row's config,
-   * else the built-in defaults. The settings service is the only channel that
-   * works across the two module graphs (the guard comes from the installed
-   * package, this engine from a preset's absolute file reference).
+   * Effective digest knobs: the guard entry's explicitly-set fields, else this
+   * row's config, else the built-in defaults.
+   *
+   * The guard entry's layer is read back through the settings service because
+   * that is the only channel that works across the two module graphs (the guard
+   * comes from the installed package, this engine from a preset's absolute file
+   * reference, so the guard's Config object is not reachable from here). Since
+   * 0.1.7 those fields are the entry's form — `describe()` projects its profile
+   * patch onto them — so a knob left unset here still falls through to this
+   * row's config, exactly as before.
    */
   private resolveKnobs(): ResolvedDigestConfig {
     const user = userLayerOf(this.ctx.get('settings'))

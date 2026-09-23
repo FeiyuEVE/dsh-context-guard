@@ -10,14 +10,16 @@
  * - reasoning blocks are dropped by default (folded into `<details>` on demand);
  * - images become placeholders (bytes are never exported);
  * - tool calls render as one line with clipped JSON arguments;
- * - tool results render as a ✓/✗-prefixed clipped preview (first/last lines);
+ * - tool results render as a ✓/✗-prefixed clipped preview (first/last lines) —
+ *   in V4 a result is its own `role: 'tool'` message, so the whole message
+ *   renders as one such preview;
  * - unknown content-block types render as a marker instead of throwing
  *   (the block vocabulary is merge-extensible).
  *
  * @module dsh-context-guard/messages-to-md
  */
 
-import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, Message, ToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { isInjectedContext } from './digest.ts'
 
 /** Length knobs for the cleaner. */
@@ -61,22 +63,27 @@ function preview(text: string, maxChars: number): string {
   return `${text.slice(0, head)}\n…(中间省略 ${text.length - head - tail} 字符)…\n${text.slice(-tail)}`
 }
 
-/** Flat text of one block tree: text blocks joined, everything else skipped. */
-function textOf(block: ContentBlock): string {
-  if (block.type === 'text') return block.text
-  if (block.type === 'tool-result') {
-    return block.content
-      .filter((inner): inner is Extract<ContentBlock, { type: 'text' }> => inner.type === 'text')
-      .map(inner => inner.text)
-      .join('\n')
-  }
-  return ''
+/** Flat text of one block list: text blocks joined, everything else skipped. */
+function textOf(content: readonly ContentBlock[]): string {
+  return content
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
 }
 
-/** Render one tool-result block as a clipped, fenced preview. */
-function renderToolResult(block: Extract<ContentBlock, { type: 'tool-result' }>, maxChars: number): string {
-  const body = textOf(block).trim()
-  const tag = block.isError === true ? '✗' : '✓'
+/**
+ * Render one tool message as a clipped, fenced preview.
+ *
+ * V4 moved tool results out of the content vocabulary: a result is now its own
+ * `role: 'tool'` message (`createToolResultMessage`), with its text blocks at
+ * the top level and its outcome on the message (`isError`) instead of on a
+ * `tool-result` block. The rendering itself is unchanged — ✓/✗ marker plus a
+ * fenced preview of the first/last lines — so an archive of the same
+ * conversation reads the same as before.
+ */
+function renderToolResult(message: ToolResultMessage, maxChars: number): string {
+  const body = textOf(message.content).trim()
+  const tag = message.isError === true ? '✗' : '✓'
   const payload = body.length === 0 ? '(无文本内容)' : preview(body, maxChars)
   const fence = fenceFor(payload)
   return `${tag} 工具结果\n${fence}\n${payload}\n${fence}`
@@ -97,8 +104,6 @@ function renderBlock(block: ContentBlock, options: Required<CleanOptions>): stri
       const fence = fenceFor(args)
       return `🔧 ${block.name}\n${fence}\n${args}\n${fence}`
     }
-    case 'tool-result':
-      return renderToolResult(block, options.resultPreviewChars)
     default:
       return `[未知内容块类型: ${String((block as { type?: unknown }).type)}]`
   }
@@ -107,11 +112,11 @@ function renderBlock(block: ContentBlock, options: Required<CleanOptions>): stri
 /** Render one LLM message to its Markdown section (empty when dropped). */
 function renderMessage(message: Message, options: Required<CleanOptions>): string {
   const heading = message.role === 'assistant' ? '## Assistant' : '## 用户'
-  const parts: string[] = []
-  for (const block of message.content) {
-    const rendered = renderBlock(block, options)
-    if (rendered.length > 0) parts.push(rendered)
-  }
+  // A tool message renders its whole content as one result preview, exactly the
+  // way a `tool-result` block used to render inside the message that carried it.
+  const parts = message.role === 'tool'
+    ? [renderToolResult(message, options.resultPreviewChars)]
+    : message.content.map(block => renderBlock(block, options)).filter(rendered => rendered.length > 0)
   if (parts.length === 0) return ''
   return `${heading}\n\n${parts.join('\n\n')}`
 }

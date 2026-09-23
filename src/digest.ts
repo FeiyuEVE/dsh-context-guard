@@ -30,7 +30,10 @@
  */
 
 import path from 'node:path'
-import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, Message, ToolResultMessage } from '@deepseek-ai/dsh-llm'
+// Type-only in effect, but imported as a value: this module is where the
+// `context-guard` source kind is declared, and the digest reads it back.
+import { noticeSummary } from './notice.ts'
 
 /** Version of the digest document format. */
 export const DIGEST_FORMAT_VERSION = 1
@@ -279,11 +282,10 @@ export function estimateMessageTokens(message: Message, mode: DigestEstimator = 
   for (const block of message.content) {
     if (block.type === 'text') parts.push(block.text)
     else if (block.type === 'tool-call') parts.push(block.arguments)
-    else if (block.type === 'tool-result') {
-      for (const inner of block.content) {
-        if (inner.type === 'text') parts.push(inner.text)
-      }
-    }
+    // V4 lifted tool results out of the content vocabulary into standalone
+    // tool-role messages (`createToolResultMessage`), so their text is no longer
+    // nested inside a `tool-result` block but arrives here as top-level `text`
+    // blocks — already counted by the first branch. Nothing to add.
   }
   return estimateTextTokens(parts.join('\n'), mode)
 }
@@ -309,15 +311,21 @@ function textOf(message: Message): string {
  * be told to drop it too.
  */
 export function isInjectedContext(message: Message): boolean {
-  const source = message.source as { kind: string; plugin?: string; form?: string }
+  const source = message.source as { kind: string; form?: string }
   // Widened to string: the source-kind vocabulary is merge-extensible, so a
   // kind this compilation does not know (skill-catalog, coordinator, …) is
   // compared without a literal-overlap error.
   const kind = source.kind
   if (kind === 'agent-instructions' || kind === 'skill-catalog' || kind === 'system') return true
-  if (kind !== 'plugin') return false
-  const plugin = source.plugin ?? ''
-  if (plugin === 'context-guard' || plugin === 'dsh-context-guard' || plugin === 'compact') return true
+  // The guard's own injections (wrap-up reminder, post-compaction resume) are
+  // this plugin's bookkeeping, never history the digest should carry: the
+  // resume prompt restates state the digest itself derives. V4 spells their
+  // source as this plugin's own declared kind instead of the removed catch-all
+  // `{ kind: 'plugin', plugin: 'context-guard' }`.
+  if (kind === 'context-guard') return true
+  // A prior compaction frame — the region this digest replaces. V4 gave it a
+  // kind of its own (`compact-checkpoint`) where 0.1.6 stamped `plugin: 'compact'`.
+  if (kind === 'compact-checkpoint') return true
   const form = source.form
   return form === 'snapshot' || form === 'instructions' || form === 'catalog'
 }
@@ -338,14 +346,46 @@ export function isInjectedContext(message: Message): boolean {
  * while this notice is delivered once and then never reappears.
  */
 function isJobNotice(message: Message): boolean {
-  const source = message.source as { kind: string; plugin?: string; form?: string; summary?: string }
-  if (source.kind !== 'plugin' || source.form !== 'notice') return false
-  if (source.plugin === 'tool-jobs') return true
-  return /^background job\b/i.test(String(source.summary ?? ''))
+  // Structural on purpose: `tool-jobs` is not a dependency of this plugin (see
+  // the module doc of `session-facts.ts` for the same trade-off), and V4 gave
+  // that producer its own kind, so the kind is compared as a plain string and
+  // the summary text keeps its say as a second signal.
+  const source = message.source as { kind: string; form?: string; summary?: string }
+  if (source.form !== 'notice') return false
+  if (source.kind === 'tool-jobs') return true
+  return /^background job\b/i.test(source.summary ?? '')
 }
 
 /**
- * First *meaningful* line of each tool-result block, with its error flag.
+ * The one-line account of one user-role context message, or undefined.
+ *
+ * Notice-first is deliberate (see `isJobNotice` for the counter-example the
+ * rule exists to avoid): a producer's summary is its bound one-liner, while the
+ * body is often the same bookkeeping text spelled out.
+ *
+ * Our own notices go through the declared kind, so the `notice` form's fields
+ * are type-checked; every *foreign* producer's is read structurally, because V4
+ * removed the catch-all `plugin` kind this rule used to gate on while
+ * `MessageSourceMap` is merge-extensible — unknown kinds fall through, which is
+ * how a consumer reads that map without depending on every producer. (In
+ * practice the guard's own notices never reach here: {@link isInjectedContext}
+ * drops them first. Reading them through the declared kind anyway keeps this
+ * rule correct on its own terms instead of by accident of that other predicate.)
+ */
+function noticeOf(message: Message): string | undefined {
+  const own = noticeSummary(message.source)
+  if (own !== undefined) return own
+  const foreign = message.source as { form?: unknown; summary?: unknown }
+  return foreign.form === 'notice' && typeof foreign.summary === 'string' ? foreign.summary : undefined
+}
+
+/**
+ * First *meaningful* line of one tool result, with its error flag.
+ *
+ * V4 (dsh 0.1.7) removed the `tool-result` content block: a tool result is now
+ * its own `role: 'tool'` message, `createToolResultMessage({ callId, content,
+ * isError })`, whose text blocks sit at the top level of `message.content` and
+ * whose outcome flag is on the *message* (`isError`), not on a block.
  *
  * The stream markers a tool wraps captured output in are skipped: a failing
  * command arrives as `[stderr]` / `bash: line 1: ps: command not found` /
@@ -353,20 +393,16 @@ function isJobNotice(message: Message): boolean {
  * reads `[stderr]` — which carries no message and matches no error signal, and
  * every real stderr failure was therefore invisible in 报错与修复.
  */
-function resultFirstLines(content: readonly ContentBlock[]): { isError: boolean; line: string }[] {
-  const lines: { isError: boolean; line: string }[] = []
-  for (const block of content) {
-    if (block.type !== 'tool-result') continue
-    const line = block.content
-      .filter((inner): inner is Extract<ContentBlock, { type: 'text' }> => inner.type === 'text')
-      .map(inner => inner.text)
-      .join('\n')
-      .split('\n')
-      .map(entry => entry.trim())
-      .find(entry => entry.length > 0 && !STREAM_MARKER.test(entry))
-    if (line !== undefined) lines.push({ isError: block.isError === true, line })
-  }
-  return lines
+function resultFirstLine(message: ToolResultMessage): { isError: boolean; line: string } | undefined {
+  const line = message.content
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+    .split('\n')
+    .map(entry => entry.trim())
+    .find(entry => entry.length > 0 && !STREAM_MARKER.test(entry))
+  // `isError` is optional on the message, so only an explicit `true` is a failure.
+  return line === undefined ? undefined : { isError: message.isError === true, line }
 }
 
 /** Parsed tool arguments, when the payload is a JSON object. */
@@ -507,33 +543,33 @@ export function extractFacts(messages: readonly Message[], itemChars = DEFAULT_I
 
     if (message.role === 'system') continue
 
-    // user-role: tool results, prior frames, or an actual request
-    const results = resultFirstLines(message.content)
-    if (results.length > 0) {
-      for (const result of results) {
+    // V4: a tool result is its own tool-role message, so it is read here and
+    // consumed whole — one message carries exactly one result.
+    if (message.role === 'tool') {
+      const result = resultFirstLine(message)
+      if (result !== undefined) {
         // A retry clears these on the next step, so they say nothing about the
         // work. Checked first: `isError` is true for them, and the flag alone
         // would keep them. See PROCESS_NOISE.
-        if (PROCESS_NOISE.test(result.line)) continue
-        // A successful call can still print a failure (`sh: 1: ps: not found`),
-        // so a non-error result is only believed when the line also has the
-        // diagnostic shape — otherwise prose that merely mentions an error is
-        // recorded as one. See DIAGNOSTIC_LINE.
-        if (!result.isError && (!ERROR_LINE.test(result.line) || !DIAGNOSTIC_LINE.test(result.line))) {
-          continue
+        if (!PROCESS_NOISE.test(result.line)) {
+          // A successful call can still print a failure (`sh: 1: ps: not found`),
+          // so a non-error result is only believed when the line also has the
+          // diagnostic shape — otherwise prose that merely mentions an error is
+          // recorded as one. See DIAGNOSTIC_LINE.
+          if (result.isError || (ERROR_LINE.test(result.line) && DIAGNOSTIC_LINE.test(result.line))) {
+            const call = callsById.get(String(message.source.callId))
+            facts.errors.push(`${call?.name ?? 'tool'}: ${result.line}`)
+          }
         }
-        const call = message.source.kind === 'tool' ? callsById.get(String(message.source.callId)) : undefined
-        facts.errors.push(`${call?.name ?? 'tool'}: ${result.line}`)
       }
       continue
     }
+
+    // user-role: prior frames or an actual request
     const text = textOf(message)
     if (text.trim().length === 0 || isInjectedContext(message)) continue
     if (isJobNotice(message)) continue
-    const notice = message.source.kind === 'plugin' && message.source.form === 'notice'
-      ? message.source.summary
-      : undefined
-    const intent = clip(notice ?? text, itemChars)
+    const intent = clip(noticeOf(message) ?? text, itemChars)
     facts.lastUserText = intent
     facts.intents.push(intent)
     for (const item of todosFromText(text)) {

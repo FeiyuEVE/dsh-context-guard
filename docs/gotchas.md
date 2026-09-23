@@ -58,18 +58,21 @@
 ## settings 与优先级
 
 - **两个模块图，settings 是唯一共享通道**：preset 用文件路径引用 `lib/compaction.mjs`（或包名），
-  guard 来自已安装包 → 模块级单例**不可能**共享。guard 注册 `context-guard` 命名空间，引擎只经
-  `describe().user` 读用户层（`userLayerOf` 特性探测 + try/catch）。优先级处处为
-  `settings 用户层 > 组合 config > 内置默认`。预设引用引擎更稳的写法是包名
+  guard 来自已安装包 → 模块级单例**不可能**共享。guard 的十五个实时字段就是 `context-guard` 这一
+  profile entry 的 form（0.1.7 起没有可注册的命名空间），引擎只经 `describe().user` 读该 entry 的
+  显式设置层（`userLayerOf` 特性探测 + try/catch）。优先级处处为
+  `实时字段 > 组合 config > 内置默认`。预设引用引擎更稳的写法是包名
   `@feiyueve/dsh-context-guard/compaction`（`exports` 已暴露，实测可从 profile 的 `node_modules`
   解析），仓库绝对路径在 `lib/` 被清后会断。
-- **提示词优先级的坑（2026-09-12 浏览器验证发现并修复）**：组合层的 `wrapUpPrompt`/`resumePrompt` 在
-  `register(..., { base })` 时已写进 settings **base 层**，`scope.get()` 返回的就是「base ⊕ 用户层」。
-  因此解析结果**含空字符串都必须照用** —— 若写成「非空才算覆盖」，用户在面板清空字段后会被 base
-  文本顶回来，**注入永远关不掉**（`pickTemplate` 已改为 `settingValue !== undefined` 即采纳）。
-  `mergeLayers` 对 `''` 是替换而非忽略，这是该语义成立的前提。回归用例见
-  `tests/context-guard.spec.ts` 的 `template precedence over the settings layer`。
-- **阈值存储**：`~/.dsh/settings.yaml` 顶层 `context-guard`，无 profile 级覆盖文件，web/staging 共享。
+- **提示词优先级的坑（2026-09-12 浏览器验证发现并修复）**：两个实时模板字段**故意不设 schema 默认值**，
+  组合层的 `wrapUpPrompt`/`resumePrompt`（0.1.7 之前唯一的键名）作为回落层由 `pickTemplate` 承接。
+  因此「未设」与「设成空串」必须可区分，且解析结果**含空字符串都必须照用** —— 若写成「非空才算覆盖」，
+  用户在面板清空字段后会被组合层文本顶回来，**注入永远关不掉**（`pickTemplate` 是
+  `settingValue !== undefined` 即采纳；表单写入对 `''` 是替换而非忽略，这是该语义成立的前提）。
+  回归用例见 `tests/context-guard.spec.ts` 的 `template precedence over the composition layer`。
+- **阈值存储**：本行的实时字段，落在**当前 profile 的 Cordis patch**（每个 profile 一份，web/staging
+  不再共享）。旧版 `~/.dsh/settings.yaml` 顶层 `context-guard` 段由 0.1.7 的 settings 服务按段名导入
+  同名 entry 一次，随后文件改名 `settings.yaml.imported`。
 
 ## 归档与 digest
 

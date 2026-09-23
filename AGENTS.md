@@ -21,12 +21,13 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
    自己写 `digest`（`raw` 全文归档默认关闭，见「关键约定」）。**不接管 dsh 的压缩执行** —— 不覆写
    `summarize()`、不改替换消息，模型看到的 checkpoint 始终是原压缩机产出的。
 
-- 阈值优先级：settings 供应商绝对阈值 > settings 默认绝对阈值 > `thresholdRatio × contextWindow`。
+- 阈值优先级：按供应商的绝对阈值 > 默认绝对阈值（两者都是本行实时字段） > `thresholdRatio × contextWindow`。
 - 续跑分级：窗口内自动压缩 2 次→L1（增量推进）、≥3 次→L2（拆分/委派，仅在请求头确实带委派工具时
   点名）、≥`resumeMaxPerWindow`→L3 不唤醒（与分级开关无关，始终生效）。只统计自动压缩
   （`sourceCommandId === undefined`），窗口内出现新的人类消息重置计数。
-- Web 设置分节「上下文守卫」三组共 15 项写入 `context-guard` settings 命名空间，host 实时 `watch`，
-  保存即生效（稀疏 patch；提示词留空 = 关闭该注入）。
+- Web 设置分节「上下文守卫」三组共 15 项 = 本行（profile entry `context-guard`）的**实时字段**
+  （`settingsFields`，0.1.7 起 settings form 就是所属 entry 的 Config）：面板写稀疏 patch 进 profile
+  patch，host 读 `Volatile` 引用，保存即生效（无 `watch`；提示词留空 = 关闭该注入）。
 
 ## 形态与入口
 
@@ -52,17 +53,18 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
 
 | 路径 | 职责 |
 |---|---|
-| `src/index.ts` | Host 插件：`apply()`、Config schema、四个事件触发、settings 注册、每会话 EpisodeState、分级续跑、**旁挂归档**（`compaction/summary` → `writeArchive`，按 `compactionId` 记路径） |
+| `src/index.ts` | Host 插件：`apply()`、Config schema（含 `settingsFields` 实时字段与 `ConfigInput`）、四个事件触发、每会话 EpisodeState、分级续跑、**旁挂归档**（`compaction/summary` → `writeArchive`，按 `compactionId` 记路径） |
 | `src/archive.ts` | **共用写盘器** `writeArchive()`：digest + `latest-digest.txt`（`raw` + `latest.txt` 仅在 `writeRawArchive` 开启时写）、跨次继承、`minEpoch` 序号；`nextEpoch` 同时扫 `*.digest.md`（否则关了 raw 序号会重来）；失败只 warn 不抛；不 import 压缩后端（host 半边可安全使用） |
 | `src/compaction.ts` | `ArchiveCutEngine`：覆写 `summarize()`，委托 `writeArchive` 并渲染指针帧 |
 | `src/digest.ts` | 确定性事实抽取与 digest 渲染（`extractFacts`/`composeDigest`/`parseDigest`/`carriedFrom`） |
 | `src/paths.ts` | 落点计算：`sessionDirName`/`archiveLocation`/`digestPointerCandidates` |
-| `src/settings.ts` | `context-guard` 命名空间：schema、默认值、优先级解析 |
+| `src/settings.ts` | 本行实时字段（`settingsFields`/`ContextGuardSettingsFields`）：schema、默认值、优先级解析、引擎侧用户层读取（`userLayerOf`） |
 | `src/resume-prompt.ts` | 纯函数提示词渲染：`decideResume`(L0–L3)、`archiveClause`（`{{archive}}` 交接文档声明块）、`buildWrapUpPrompt`、内置默认模板 |
 | `src/session-facts.ts` | 结构化读会话：压缩节奏、可用委派工具、待办、最后一次人类意图 |
 | `src/messages-to-md.ts` | 纯函数清洗：会话区段 → Markdown（无 I/O、无时间戳、可 golden 测试） |
 | `src/sanitize.ts` | 归档文本卫生：剥 ANSI、CR→LF、NUL→`␀`、丢其余 C0/DEL（写盘器统一调用） |
 | `src/log.ts` | 单行日志 sink：`context-guard[/scope]: event k=v`，同时投递 `ctx.logger` 与 console |
+| `src/notice.ts` | 本插件自己的 `MessageSourceMap` kind（`context-guard`）+ notice 源构造/读取（V4 无 catch-all `plugin` kind） |
 | `src/client.js` | 浏览器端源码：`settings.section`「上下文守卫」三组表单 |
 | `tests/` | vitest：11 个 spec + mock adapter / stub 引擎，无网络 |
 | `docs/digest-format.md` | digest 格式契约（结构、抽取口径、预算梯度、继承、版本规则、边界） |
@@ -102,7 +104,7 @@ npm run verify      # typecheck && test && build（顺序固定）
   `src/archive.ts`**：它的编号正则必须同时覆盖 `*.raw.md` 与 `*.digest.md`，只扫 raw 会在关闭时
   让序号每次从 1 重来并覆盖上一份摘要。
 - **摘要抽取的每条判据都有「反面」（0.4.1 起）**：`isError: true` 不等于值得交接（策略拒绝重试即消）、
-  数字前缀不是程序名（`grep -n` 的 `38:` 骗过诊断形态）、`plugin notice` 的 `summary` 不一定是人话
+  数字前缀不是程序名（`grep -n` 的 `38:` 骗过诊断形态）、notice 的 `summary` 不一定是人话
   （`tool-jobs` 的 summary 是命令行）、扩展名不是技术栈。改 `src/digest.ts` 口径前先读
   `docs/digest-format.md` §4 与 `docs/gotchas.md` 的四处误判记录；新判据要配 `tests/digest.spec.ts`
   的**反例**用例。想验证真实效果，把线上区间灌回抽取器重放（方法见 `docs/gotchas.md` 末条：
@@ -135,7 +137,7 @@ npm run verify      # typecheck && test && build（顺序固定）
   `goal-owned post-compaction continuation`（把通道改回 `followup()` 该组会挂 3 条），教训见
   `docs/gotchas.md`「续跑注入通道与 goal」。
 - **日志一律走 `createLogSink`**（`ctx.logger` + console 双投递），字段不含正文。
-- **配置优先级处处一致**：`settings 用户层 > 组合 config > 内置默认`；解析结果含空字符串都必须照用。
+- **配置优先级处处一致**：`本行实时字段（面板值） > 组合 config > 内置默认`；解析结果含空字符串都必须照用。
 
 ## 文档
 

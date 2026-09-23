@@ -12,6 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import type { Fiber } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
@@ -21,70 +22,52 @@ import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-test
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import * as ContextGuard from '../src/index.ts'
-import type { Config } from '../src/index.ts'
+import type { ConfigInput } from '../src/index.ts'
 import { FRAME_MARKER } from '../src/digest.ts'
 import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
 import type { ScriptEntry } from './mock-adapter.ts'
 import { StubCompactionEngine } from './stub-compaction.ts'
 
+// A producer kind for messages this suite splices into a session to grow its
+// surface without pretending to be a human turn. V4 has no catch-all `plugin`
+// kind to borrow, so the fixture declares its own exactly the way a real
+// producer does — and `compactionPace` anchors on `kind: 'user'` alone, so any
+// other kind keeps the human anchor in place.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'test-fixture': { kind: 'test-fixture' }
+  }
+}
+
 /** Long initial task text: ~440 heuristic tokens, over a 255-token threshold. */
 const TASK_TEXT = 'start '.repeat(350)
 
 /**
- * Minimal fake settings provider serving the `context-guard` namespace.
+ * The one write the Loader performs when an edit changes only live fields.
  *
- * `get()` returns `base` layered under the user section, because the real
- * provider resolves the composition base into every read: a double returning
- * only the user section would make template precedence behave differently from
- * production (`withDefaults` would turn an absent template into the empty
- * string, i.e. "disabled").
+ * `SettingsForms` persists a form write into the profile patch, and the Loader
+ * then resolves the new config through the schema and copies each changed
+ * reference's snapshot into the *running* one — `updateVolatile` in
+ * `@deepseek-ai/cosmokit`, keyed by this registered symbol (registered, not
+ * module-local, so the identity holds across copies of the library).
+ *
+ * A unit test mounts no Loader, so it makes that same single call. Committing
+ * into the fiber's own reference is what proves the guard re-reads the live
+ * value on every decision instead of caching a snapshot — which is what the
+ * removed `scope.watch()` used to have to guarantee.
  */
-type ThresholdSettingsValue = {
-  defaultThresholdTokens: number
-  providerThresholds: { provider: string; thresholdTokens: number }[]
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/** Commit a snapshot into one live config field, as the Loader's volatile path does. */
+function commitLive(ref: unknown, value: unknown): void {
+  const write: unknown = Reflect.get(ref as object, VOLATILE_WRITE)
+  if (typeof write !== 'function') throw new TypeError('not a volatile config reference')
+  write.call(ref, value)
 }
-interface FakeSettingsScope {
-  get(): Record<string, unknown>
-  watch(callback: (value: Record<string, unknown>) => void): () => void
-  update(patch: object): Promise<void>
-}
-function fakeSettings(initial: ThresholdSettingsValue & Record<string, unknown>): {
-  value: Record<string, unknown>
-  scope: FakeSettingsScope | undefined
-  provide(ctx: Context): void
-} {
-  const watchers = new Set<(value: Record<string, unknown>) => void>()
-  let base: Record<string, unknown> = {}
-  const state: {
-    value: Record<string, unknown>
-    scope: FakeSettingsScope | undefined
-    provide(ctx: Context): void
-  } = {
-    value: initial,
-    scope: undefined,
-    provide(ctx) {
-      /** Resolved view: composition base under the user section. */
-      const resolve = (): Record<string, unknown> => ({ ...base, ...state.value })
-      ctx.provide('settings', {
-        register(_ns: string, _schema: unknown, options?: { base?: Record<string, unknown> }) {
-          base = options?.base ?? {}
-          state.scope = {
-            get: () => resolve(),
-            watch: (callback: (value: Record<string, unknown>) => void) => {
-              watchers.add(callback)
-              return () => { watchers.delete(callback) }
-            },
-            update: async (patch: object) => {
-              state.value = { ...state.value, ...patch }
-              for (const watcher of watchers) watcher(resolve())
-            },
-          }
-          return state.scope
-        },
-      } as never)
-    },
-  }
-  return state
+
+/** The live reference behind one field of a running fiber's resolved Config. */
+function liveField(fiber: Fiber, field: string): unknown {
+  return Reflect.get(fiber.config as object, field)
 }
 
 /**
@@ -101,6 +84,14 @@ type GoalViewLike = {
 /**
  * Boot the core spine, the stub compaction backend, and the guard with a
  * scripted mock adapter, and start one over-threshold turn.
+ * @param config - the guard row's plain configuration. Since 0.1.7 this is also
+ *   where the Web panel's live fields arrive: a settings form *is* the owning
+ *   profile entry's Config, so "what the user set in the panel" and "what the
+ *   composition declared" are one object (the live fields still resolve
+ *   "user > config > default" inside the schema).
+ * @param live - live fields merged under `config`, kept as a separate argument
+ *   only so a test can name the panel-side knobs it means without restating the
+ *   composition switches beside them.
  * @param presets - optional seam factory: receives the harness context and
  *   returns an `agentPresets`-shaped service (or undefined). Mirrors the real
  *   topology where the guard is a host row and the compaction provider lives
@@ -114,18 +105,23 @@ type GoalViewLike = {
  */
 async function harness(
   script: ScriptEntry[],
-  config: Config = {},
+  config: ConfigInput = {},
   contextWindow = 300,
   withCompaction = true,
-  settings?: ReturnType<typeof fakeSettings>,
+  live: ConfigInput = {},
   presets?: (ctx: Context) => { serviceFor(agent: { ctx: Context }, name: string): unknown } | undefined,
   cwd?: string,
   goals?: GoalViewLike,
-): Promise<{ ctx: Context; agent: Agent; compaction: StubCompactionEngine | undefined; adapter: MockAdapter }> {
+): Promise<{
+  ctx: Context
+  agent: Agent
+  compaction: StubCompactionEngine | undefined
+  adapter: MockAdapter
+  fiber: Fiber
+}> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   await ctx.plugin(TokenMeter)
-  settings?.provide(ctx)
   const presetsValue = presets?.(ctx)
   if (presetsValue !== undefined) ctx.provide('agentPresets', presetsValue as never)
   if (goals !== undefined) {
@@ -139,7 +135,7 @@ async function harness(
   }
   const compaction = withCompaction ? new StubCompactionEngine(ctx) : undefined
   await ctx.plugin(AgentLoop, { agents: [] })
-  await ctx.plugin(ContextGuard, config)
+  const fiber = await ctx.plugin(ContextGuard, { ...live, ...config })
   ctx.tools.register(defineContentToolFixture({
     name: 'probe',
     description: 'p',
@@ -154,7 +150,7 @@ async function harness(
     cwd === undefined ? {} : { cwd },
   )
   agent.followup(createUserMessage({ content: [{ type: 'text', text: TASK_TEXT }], source: { kind: 'user' } }))
-  return { ctx, agent, compaction, adapter }
+  return { ctx, agent, compaction, adapter, fiber }
 }
 
 /** All context-guard plugin-source user messages, in log order. */
@@ -162,8 +158,7 @@ function guardMessages(agent: Agent): { text: string; seq: number }[] {
   return [...agent.session.snapshotEvents()]
     .filter((e): e is SessionEvent<'user/message'> =>
       e.type === 'user/message'
-      && e.data.source.kind === 'plugin'
-      && e.data.source.plugin === 'context-guard')
+      && e.data.source.kind === 'context-guard')
     .map(e => ({
       text: e.data.content.filter(block => block.type === 'text').map(block => block.text).join('|'),
       seq: e.seq,
@@ -197,7 +192,7 @@ function nextTurnGuardInserts(agent: Agent): string[] {
     .filter((e): e is SessionEvent<'agent/inbox/spliced'> => e.type === 'agent/inbox/spliced')
     .filter(e => e.data.target === 'next-turn')
     .flatMap(e => e.data.inserted)
-    .filter(m => m.source.kind === 'plugin' && m.source.plugin === 'context-guard')
+    .filter(m => m.source.kind === 'context-guard')
     .map(m => m.id)
 }
 
@@ -505,7 +500,7 @@ describe('resume escalation', () => {
     // therefore the compaction count — is not reset by the growth turn.
     agent.followup(createUserMessage({
       content: [{ type: 'text', text: 'grow '.repeat(200) }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test-fixture' },
     }))
     await vi.waitFor(() => {
       expect(adapter.requests).toHaveLength(3)
@@ -609,12 +604,12 @@ describe('goal-owned post-compaction continuation', () => {
       {},
       300,
       true,
-      fakeSettings({
+      {
         defaultThresholdTokens: 0,
         providerThresholds: [],
         resumeMaxPerWindow: 1,
         resumeWindowMinutes: 30,
-      }),
+      },
       undefined,
       undefined,
       { phase: 'active', activation: 'armed' },
@@ -623,7 +618,7 @@ describe('goal-owned post-compaction continuation', () => {
     // Held work parks as step context for whichever turn opens next...
     await vi.waitFor(() => {
       expect(agent.inbox.nextStep.some(m =>
-        m.source.kind === 'plugin' && m.source.plugin === 'context-guard')).toBe(true)
+        m.source.kind === 'context-guard')).toBe(true)
     })
     // ...so it neither takes the goal's boundary nor wakes the agent itself.
     expect(nextTurnGuardInserts(agent)).toEqual([])
@@ -633,13 +628,13 @@ describe('goal-owned post-compaction continuation', () => {
   })
 })
 
-describe('settings-provided absolute thresholds', () => {
+describe('absolute token thresholds', () => {
   it('uses the per-provider absolute token threshold: above it nothing fires, at it the loop runs', async () => {
     // Task pressure ≈ 560 tokens incl. the system prompt (ratio fallback 255).
-    const high = fakeSettings({
+    const high = {
       defaultThresholdTokens: 0,
       providerThresholds: [{ provider: 'mock', thresholdTokens: 600 }],
-    })
+    }
     const first = await harness(
       [textResponse('first turn')],
       {},
@@ -653,10 +648,10 @@ describe('settings-provided absolute thresholds', () => {
     expect(first.compaction!.compactNowCalls).toEqual([])
     void first.ctx
 
-    const low = fakeSettings({
+    const low = {
       defaultThresholdTokens: 0,
       providerThresholds: [{ provider: 'mock', thresholdTokens: 400 }],
-    })
+    }
     const second = await harness(
       [textResponse('first turn'), textResponse('continuing')],
       {},
@@ -674,16 +669,16 @@ describe('settings-provided absolute thresholds', () => {
   })
 
   it('uses the default absolute threshold for providers without an entry', async () => {
-    const settings = fakeSettings({
+    const live = {
       defaultThresholdTokens: 400,
       providerThresholds: [],
-    })
+    }
     const { ctx, agent, compaction } = await harness(
       [textResponse('first turn'), textResponse('continuing')],
       {},
       300,
       true,
-      settings,
+      live,
     )
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
     const messages = guardMessages(agent)
@@ -693,24 +688,27 @@ describe('settings-provided absolute thresholds', () => {
     void ctx
   })
 
-  it('applies settings updates live through watch: a lowered threshold takes effect on the next turn', async () => {
-    const settings = fakeSettings({
-      defaultThresholdTokens: 1000,
-      providerThresholds: [],
-    })
-    const { ctx, agent, compaction } = await harness(
+  it('reads the live field on every decision: a committed threshold takes effect on the next turn', async () => {
+    // Since 0.1.7 a form write lands in the profile patch and the Loader commits
+    // the new value into the running fiber's own reference; the guard reads that
+    // reference at each decision instead of caching a snapshot, so the change is
+    // visible on the next turn without a remount. See `commitLive`.
+    const { ctx, agent, compaction, fiber } = await harness(
       [textResponse('first turn'), textResponse('second turn'), textResponse('continuing')],
       {},
       300,
       true,
-      settings,
+      {
+        defaultThresholdTokens: 1000,
+        providerThresholds: [],
+      },
     )
     // Above 1000 nothing fires; the first turn settles clean.
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(1) })
     expect(guardMessages(agent)).toEqual([])
 
     // Lower the default threshold below the ~560-token pressure.
-    await settings.scope!.update({ defaultThresholdTokens: 100 })
+    commitLive(liveField(fiber, 'defaultThresholdTokens'), 100)
     agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go on' }], source: { kind: 'user' } }))
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(3) })
     const messages = guardMessages(agent)
@@ -722,25 +720,25 @@ describe('settings-provided absolute thresholds', () => {
 })
 
 /*
- * Template precedence. The composition value is baked into the settings base
- * layer, so the resolved settings value is authoritative *including when it is
- * the empty string*: clearing a template field in the Web panel is the only way
- * a user can turn that injection off, and it must not silently fall back to the
- * composition text. Found by browser verification on 2026-09-12.
+ * Template precedence. A live template has no schema default, so an unset field
+ * falls through to the composition's own `wrapUpPrompt` / `resumePrompt` text,
+ * while an explicit empty string is authoritative *including when it is empty*:
+ * clearing a template field in the Web panel is the only way a user can turn
+ * that injection off, and it must not silently fall back to the composition
+ * text. Found by browser verification on 2026-09-12.
  */
-describe('template precedence over the settings layer', () => {
-  it('an empty settings wrap-up template disables the reminder but not compaction', async () => {
-    const settings = fakeSettings({
-      defaultThresholdTokens: 400,
-      providerThresholds: [],
-      wrapUpPromptTemplate: '',
-    })
+describe('template precedence over the composition layer', () => {
+  it('an empty live wrap-up template disables the reminder but not compaction', async () => {
     const { ctx, agent, compaction } = await harness(
       [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('wrapping up now'), textResponse('continuing')],
       {},
       300,
       true,
-      settings,
+      {
+        defaultThresholdTokens: 400,
+        providerThresholds: [],
+        wrapUpPromptTemplate: '',
+      },
     )
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
     const messages = guardMessages(agent)
@@ -751,18 +749,17 @@ describe('template precedence over the settings layer', () => {
     void ctx
   })
 
-  it('an empty settings resume template disables the post-compaction wake-up', async () => {
-    const settings = fakeSettings({
-      defaultThresholdTokens: 400,
-      providerThresholds: [],
-      resumePromptTemplate: '',
-    })
+  it('an empty live resume template disables the post-compaction wake-up', async () => {
     const { ctx, agent, compaction } = await harness(
       [textResponse('first turn'), textResponse('unreachable')],
       {},
       300,
       true,
-      settings,
+      {
+        defaultThresholdTokens: 400,
+        providerThresholds: [],
+        resumePromptTemplate: '',
+      },
     )
     // Compaction still runs on idle; only the continuation is withheld, so the
     // turn count stays at one.
@@ -773,14 +770,13 @@ describe('template precedence over the settings layer', () => {
     void ctx
   })
 
-  it('a composition-configured template still wins when settings has no override', async () => {
-    const settings = fakeSettings({ defaultThresholdTokens: 400, providerThresholds: [] })
+  it('a composition-configured template still wins while the live field is unset', async () => {
     const { ctx, agent } = await harness(
       [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('config text'), textResponse('continuing')],
       { wrapUpPrompt: '配置层收尾提醒' },
       300,
       true,
-      settings,
+      { defaultThresholdTokens: 400, providerThresholds: [] },
     )
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
     expect(guardMessages(agent).some(m => m.text.includes('配置层收尾提醒'))).toBe(true)
@@ -917,20 +913,21 @@ describe('side-car archiving beside a foreign compaction engine', () => {
   }
 
   /**
-   * Settings with the full transcript dump switched on.
+   * The live knobs with the full transcript dump switched on.
    *
-   * The side-car digest knobs are read from the settings layer only (the
-   * composition entry has no digest fields), so these tests must go through
-   * `fakeSettings` to get a `raw` member at all: since 0.4.0 the transcript is
-   * opt-in and the default ships the digest alone. `defaultThresholdTokens: 0`
-   * keeps threshold resolution on the composition/ratio path the tests expect.
+   * The side-car digest knobs are live fields of the guard row (the engine row
+   * has digest fields of its own, but the side-car writer reads them from this
+   * layer only), and since 0.4.0 the transcript is opt-in: without
+   * `writeRawArchive` there is no `raw` member to assert on.
+   * `defaultThresholdTokens: 0` keeps threshold resolution on the
+   * composition/ratio path the tests expect.
    */
-  function rawSidecar(): ReturnType<typeof fakeSettings> {
-    return fakeSettings({
+  function rawSidecar(): ConfigInput {
+    return {
       defaultThresholdTokens: 0,
       providerThresholds: [],
       writeRawArchive: true,
-    })
+    }
   }
 
   /** Cut once and wait for the post-cut continuation to settle. */
@@ -1067,7 +1064,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     // reset, then cut again.
     agent.followup(createUserMessage({
       content: [{ type: 'text', text: 'grow '.repeat(200) }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test-fixture' },
     }))
     await vi.waitFor(() => {
       expect(adapter.requests).toHaveLength(3)

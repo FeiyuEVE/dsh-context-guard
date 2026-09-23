@@ -1,14 +1,24 @@
 /**
- * The `context-guard` settings namespace: one schema and one resolution order
- * shared by the host guard row and the compaction backend.
+ * The `context-guard` configuration surface: one schema and one resolution
+ * order shared by the host guard row and the compaction backend.
  *
- * The guard registers the namespace (it owns the composition entry and the Web
- * panel), and the archive engine only *reads* the user layer through
- * {@link userLayerOf}. Two independently mounted plugins may come from
- * different module graphs — the archive-cut preset references the engine by
- * absolute file path while the guard comes from the installed package — so the
- * settings service is the only shared channel between them; a module-level
- * singleton would not be.
+ * dsh 0.1.7 replaced the register-a-namespace settings provider with
+ * `SettingsForms`: a settings form *is* the live half of one profile entry's
+ * own Config, and the profile patch a form write lands in is that entry's
+ * config. So the knobs below are declared as `Volatile<T>` fields of the guard
+ * row ({@link settingsFields}, spread into `Config` by `index.ts`) instead of
+ * being registered under a namespace key. The Web panel keeps editing the same
+ * fifteen fields under their original names — the panel is now the entry's
+ * auto-generated form, addressed by profile entry id rather than by a
+ * registered namespace.
+ *
+ * The guard reads its own knobs through those references, so `.get()` already
+ * answers "user override > composition config > built-in default". The archive
+ * engine is a *separate* row (a preset may reference it by absolute file path,
+ * i.e. from another module graph, where the guard's Config object is not
+ * reachable at all), so it still reads the guard entry's explicitly-set layer
+ * through {@link userLayerOf}: the settings service remains the only shared
+ * channel between the two, and a module-level singleton still would not be.
  *
  * Resolution order, everywhere:
  *   settings user layer  >  composition config  >  built-in default.
@@ -17,12 +27,22 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import type { Volatile } from '@deepseek-ai/cordis'
 // Type-only: pulls in the `ctx.settings` declaration merge.
 import type {} from '@deepseek-ai/dsh-settings'
 import type { DigestEstimator } from './digest.ts'
 import type { ArchiveLayout } from './paths.ts'
 
-/** The one settings namespace this plugin owns. */
+/**
+ * The profile entry id whose form carries this plugin's knobs.
+ *
+ * A form namespace is the local id of one profile entry, so this is the id
+ * `cordis.patch.yml` gives the guard row (`id: context-guard`); the archive
+ * engine matches the same string against `describe()` descriptors. A row
+ * mounted under a different id keeps its own form — the Web panel still edits
+ * it — but the engine's user-layer read cannot find it, exactly the limitation
+ * the registered namespace name had before 0.1.7.
+ */
 export const SETTINGS_NAMESPACE = 'context-guard'
 
 /** One provider route's absolute token threshold. */
@@ -38,7 +58,7 @@ export interface ContextGuardSettingsValue {
   /** Global absolute threshold for routes without an entry; `0` means unset. */
   defaultThresholdTokens: number
   /** Per-route absolute thresholds, overriding the global one. */
-  providerThresholds: ProviderThreshold[]
+  providerThresholds: readonly ProviderThreshold[]
   /** Whether a completed compaction writes a digest document. */
   digestEnabled: boolean
   /** Upper bound on digest size, in estimated tokens. */
@@ -76,7 +96,13 @@ export interface ContextGuardSettingsValue {
   wrapUpPromptTemplate: string
 }
 
-/** Built-in defaults: the composition base layer when config sets nothing. */
+/**
+ * Built-in defaults, mirroring the defaults declared in {@link settingsFields}.
+ *
+ * The schema is what actually supplies them (a live field is never absent once
+ * parsed); this table is the floor the guard-side resolution falls back to, and
+ * the value the archive engine layers its own row config over.
+ */
 export const SETTINGS_DEFAULTS: ContextGuardSettingsValue = {
   defaultThresholdTokens: 0,
   providerThresholds: [],
@@ -95,27 +121,75 @@ export const SETTINGS_DEFAULTS: ContextGuardSettingsValue = {
   wrapUpPromptTemplate: '',
 }
 
-/** The settings namespace schema. */
-export const settingsSchema: z<ContextGuardSettingsValue> = z.object({
-  defaultThresholdTokens: z.number().step(1).min(0).default(0),
+/**
+ * The live half of the guard row's Config, as a schema fragment: these are the
+ * fields the Web panel renders and writes back through the profile patch.
+ *
+ * dsh 0.1.7 has no namespace-level schema to register any more — the form is
+ * derived from the owning entry's Config — so `index.ts` spreads this fragment
+ * into the row's own `z.object` alongside its plain (composition-only) fields.
+ * Defaults, bounds and steps are unchanged from the pre-0.1.7 namespace schema,
+ * so every knob keeps the value and meaning it had.
+ */
+export const settingsFields = {
+  defaultThresholdTokens: z.number().step(1).min(0).default(0).volatile(),
   providerThresholds: z.array(z.object({
     provider: z.string().required(),
     thresholdTokens: z.number().step(1).min(1).required(),
-  })).default([]),
-  digestEnabled: z.boolean().default(true),
-  digestMaxTokens: z.number().step(1).min(80).default(800),
-  digestTargetRatio: z.number().min(0.05).max(0.95).default(0.45),
-  digestCarryForward: z.boolean().default(true),
-  digestTokenEstimator: z.union([z.const('cjk'), z.const('ascii')]).default('cjk'),
-  writeRawArchive: z.boolean().default(false),
-  rawExcludeInjected: z.boolean().default(false),
-  archiveLayout: z.union([z.const('session'), z.const('flat')]).default('session'),
-  resumeEscalation: z.boolean().default(true),
-  resumeWindowMinutes: z.number().step(1).min(1).default(30),
-  resumeMaxPerWindow: z.number().step(1).min(1).default(5),
-  resumePromptTemplate: z.string().default(''),
-  wrapUpPromptTemplate: z.string().default(''),
-})
+  })).default([]).volatile(),
+  digestEnabled: z.boolean().default(true).volatile(),
+  digestMaxTokens: z.number().step(1).min(80).default(800).volatile(),
+  digestTargetRatio: z.number().min(0.05).max(0.95).default(0.45).volatile(),
+  digestCarryForward: z.boolean().default(true).volatile(),
+  digestTokenEstimator: z.union([z.const('cjk'), z.const('ascii')]).default('cjk').volatile(),
+  writeRawArchive: z.boolean().default(false).volatile(),
+  rawExcludeInjected: z.boolean().default(false).volatile(),
+  archiveLayout: z.union([z.const('session'), z.const('flat')]).default('session').volatile(),
+  resumeEscalation: z.boolean().default(true).volatile(),
+  resumeWindowMinutes: z.number().step(1).min(1).default(30).volatile(),
+  resumeMaxPerWindow: z.number().step(1).min(1).default(5).volatile(),
+  // The two templates carry *no* schema default on purpose: an absent field must
+  // stay "unset" so `pickTemplate` can fall through to the composition's own
+  // `resumePrompt` / `wrapUpPrompt` field (the pre-0.1.7 key names, still
+  // honoured), while an explicit empty string must be taken verbatim — that is
+  // how the panel disables the injection.
+  resumePromptTemplate: z.string().volatile(),
+  wrapUpPromptTemplate: z.string().volatile(),
+}
+
+/** The live half of the guard row's Config, as the parsed value the guard reads. */
+export interface ContextGuardSettingsFields {
+  /** See {@link ContextGuardSettingsValue.defaultThresholdTokens}. */
+  defaultThresholdTokens: Volatile<number>
+  /** See {@link ContextGuardSettingsValue.providerThresholds}. */
+  providerThresholds: Volatile<ProviderThreshold[]>
+  /** See {@link ContextGuardSettingsValue.digestEnabled}. */
+  digestEnabled: Volatile<boolean>
+  /** See {@link ContextGuardSettingsValue.digestMaxTokens}. */
+  digestMaxTokens: Volatile<number>
+  /** See {@link ContextGuardSettingsValue.digestTargetRatio}. */
+  digestTargetRatio: Volatile<number>
+  /** See {@link ContextGuardSettingsValue.digestCarryForward}. */
+  digestCarryForward: Volatile<boolean>
+  /** See {@link ContextGuardSettingsValue.digestTokenEstimator}. */
+  digestTokenEstimator: Volatile<DigestEstimator>
+  /** See {@link ContextGuardSettingsValue.writeRawArchive}. */
+  writeRawArchive: Volatile<boolean>
+  /** See {@link ContextGuardSettingsValue.rawExcludeInjected}. */
+  rawExcludeInjected: Volatile<boolean>
+  /** See {@link ContextGuardSettingsValue.archiveLayout}. */
+  archiveLayout: Volatile<ArchiveLayout>
+  /** See {@link ContextGuardSettingsValue.resumeEscalation}. */
+  resumeEscalation: Volatile<boolean>
+  /** See {@link ContextGuardSettingsValue.resumeWindowMinutes}. */
+  resumeWindowMinutes: Volatile<number>
+  /** See {@link ContextGuardSettingsValue.resumeMaxPerWindow}. */
+  resumeMaxPerWindow: Volatile<number>
+  /** See {@link ContextGuardSettingsValue.resumePromptTemplate}; `undefined` = unset. */
+  resumePromptTemplate: Volatile<string | undefined>
+  /** See {@link ContextGuardSettingsValue.wrapUpPromptTemplate}; `undefined` = unset. */
+  wrapUpPromptTemplate: Volatile<string | undefined>
+}
 
 /** Fill every absent field with its built-in default. */
 export function withDefaults(value: Partial<ContextGuardSettingsValue> | undefined): ContextGuardSettingsValue {
@@ -200,7 +274,7 @@ export interface ResolvedDigestConfig {
 /**
  * Resolve the digest knobs for one compaction: user settings, then the
  * engine's composition entry, then the built-in default.
- * @param user - the namespace's raw user layer, when the guard registered one.
+ * @param user - the guard entry's explicitly-set fields, when one exists.
  * @param entry - the engine row's own config; absent for a caller with no row
  *   of its own (the guard's side-car writer reads only the settings layer).
  */
@@ -220,7 +294,7 @@ export function resolveDigestConfig(
   }
 }
 
-/** One descriptor as this plugin reads it: the namespace plus its user layer. */
+/** One descriptor as this plugin reads it: the form namespace plus its user layer. */
 interface SettingsDescriptorLike {
   ns: string
   user?: unknown
@@ -232,12 +306,18 @@ interface SettingsReaderLike {
 }
 
 /**
- * The namespace's raw user layer, for a reader that must not register it.
+ * The guard entry's explicitly-set layer, for a reader that only observes it.
+ *
+ * `describe()` projects each active entry's overrides onto its volatile form
+ * fields, so `user` is exactly "fields the profile patch sets" — the same
+ * meaning the registered namespace's raw user layer had before 0.1.7, and the
+ * reason a field absent here still falls through to the engine row's own config
+ * instead of being pinned by the guard's schema default.
  *
  * Feature-detected on purpose: `describe` is optional for a caller that only
- * ever sees a settings provider, and a provider serving this namespace without
- * it (a test double, an older composition) degrades to "no user overrides"
- * instead of throwing inside a compaction.
+ * ever sees a settings provider, and a provider serving this entry without it
+ * (a test double, an older composition) degrades to "no user overrides" instead
+ * of throwing inside a compaction.
  *
  * @param settings - `ctx.get('settings')`, of unknown shape to this caller.
  * @returns the user section, or undefined when absent/unreadable.

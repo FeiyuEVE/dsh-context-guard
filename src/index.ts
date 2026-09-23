@@ -44,16 +44,17 @@
  * entirely — a compaction/resume loop that keeps repeating burns tokens
  * without changing the working style that causes it.
  *
- * All injected content is user-role context stamped with the plugin source
- * (`{ kind: 'plugin', plugin: 'context-guard' }`), so it is durable in the
- * session log and reconstructable (model-visible ⟺ logged).
+ * All injected content is user-role context stamped with this plugin's own
+ * message source (`{ kind: 'context-guard', form: 'notice' }` — see
+ * `notice.ts`), so it is durable in the session log and reconstructable
+ * (model-visible ⟺ logged).
  *
  * @module dsh-context-guard
  */
 
 import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -69,6 +70,7 @@ import { writeArchive } from './archive.ts'
 import type { Artifacts } from './archive.ts'
 import { DIGEST_FORMAT_VERSION, FRAME_MARKER, digestPathFrom, estimateTextTokens } from './digest.ts'
 import { createLogSink, logInfo, logWarn } from './log.ts'
+import { noticeSource } from './notice.ts'
 import { archiveLocation, digestPointerCandidates, handoffNotePath } from './paths.ts'
 import {
   DEFAULT_RESUME_PROMPT,
@@ -84,14 +86,12 @@ import {
   pendingTodos,
 } from './session-facts.ts'
 import {
-  SETTINGS_DEFAULTS,
-  SETTINGS_NAMESPACE,
   overridesOf,
   resolveDigestConfig,
-  settingsSchema,
+  settingsFields,
   withDefaults,
 } from './settings.ts'
-import type { ContextGuardSettingsValue, ThresholdOverrides } from './settings.ts'
+import type { ContextGuardSettingsFields, ContextGuardSettingsValue } from './settings.ts'
 
 export const name = 'context-guard'
 
@@ -102,12 +102,26 @@ export const inject = ['llm', 'tokenMeter', 'agents']
 const DEFAULT_DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow', 'ralph']
 
 /**
- * Plugin config, validated by the same-named schemastery schema. An empty
- * `wrapUpPrompt` disables the step-end reminder and an empty `resumePrompt`
- * disables the post-compaction resume; the two booleans are explicit
- * switches for the same injections.
+ * Plugin config, validated by the same-named schemastery schema.
+ *
+ * Two layers live here, both resolved through the one order documented in
+ * `settings.ts`:
+ *
+ * - the live knobs ({@link ContextGuardSettingsFields}, spread in from
+ *   `settingsFields`) are `Volatile<T>` references — since 0.1.7 a settings
+ *   form *is* the owning profile entry's Config, so these are the fifteen items
+ *   the Web panel renders and writes back through the profile patch, and
+ *   `.get()` returns the user's value live;
+ * - the plain fields below are composition-only switches, exactly as before.
+ *   `wrapUpPrompt` / `resumePrompt` also stay the fallback *text* of the two
+ *   live templates, so a composition written before 0.1.7 (when those were the
+ *   only key names) keeps working unchanged.
+ *
+ * An empty `wrapUpPrompt` disables the step-end reminder and an empty
+ * `resumePrompt` disables the post-compaction resume; the two booleans are
+ * explicit switches for the same injections.
  */
-export interface Config {
+export interface Config extends ContextGuardSettingsFields {
   /**
    * Fraction of the routed model's context window above which the guard acts
    * (default `0.85`).
@@ -115,12 +129,14 @@ export interface Config {
   thresholdRatio?: number
   /**
    * Wrap-up reminder folded into the next step's messages when pressure
-   * exceeds the threshold (default prompts a quick finish and stop).
+   * exceeds the threshold (default prompts a quick finish and stop). Used when
+   * the live `wrapUpPromptTemplate` is unset.
    */
   wrapUpPrompt?: string
   /**
    * Continuation prompt queued as a new turn after a successful compaction
-   * (default asks the agent to continue from the archived state).
+   * (default asks the agent to continue from the archived state). Used when the
+   * live `resumePromptTemplate` is unset.
    */
   resumePrompt?: string
   /** Whether an over-threshold idle session is compacted automatically (default `true`). */
@@ -136,7 +152,17 @@ export interface Config {
   delegationTools?: string[]
 }
 
-export const Config: z<Config> = z.object({
+/**
+ * The schema is deliberately *not* annotated with `z<Config>`: that annotation
+ * would fix the schema's input side to the parsed shape, and the live fields'
+ * parsed shape is a bag of references — while what a composition (and
+ * `ctx.plugin`) passes is the plain value. Left inferred, the input side stays
+ * plain and the output side carries the references, which is what `Config`
+ * above describes (the same split `@deepseek-ai/dsh-llm-deepseek` uses).
+ */
+export const Config = z.object({
+  // Live fields first: this is the Web form, in render order.
+  ...settingsFields,
   // Unbounded on purpose: an out-of-range ratio is normalized in apply (with
   // a logged fallback) instead of failing plugin load, so a misconfiguration
   // can never take the host process down.
@@ -148,11 +174,17 @@ export const Config: z<Config> = z.object({
   delegationTools: z.array(z.string()).default(DEFAULT_DELEGATION_TOOLS),
 })
 
-/** The plugin source stamped on every injected context message. */
-const PLUGIN_SOURCE = {
-  kind: 'plugin',
-  plugin: 'context-guard',
-} as const
+/**
+ * Plain configuration a composition — or a caller of `ctx.plugin` — passes: the
+ * same fields as {@link Config}, but every live field as a plain value, because
+ * that is what the schema accepts. Validation turns each one into the stable
+ * reference {@link Config} describes, and a field left out keeps its schema
+ * default (an out-of-range ratio is still normalized in `apply` rather than
+ * failing plugin load).
+ */
+export type ConfigInput = {
+  [K in keyof Config]?: Config[K] extends Volatile<infer T> ? Exclude<T, undefined> : Config[K]
+}
 
 /** One-line account of the wrap-up reminder for collapsed transcript rows. */
 const WRAP_UP_SUMMARY = '上下文超过阈值，已提醒 agent 收尾'
@@ -251,16 +283,17 @@ interface EpisodeState {
 }
 
 /**
- * Resolve one template through the shared precedence: the settings value wins
+ * Resolve one template through the shared precedence: the live value wins
  * whenever it is present, else the composition config, else the built-in text.
  *
- * The composition value is already baked into the settings base layer at
- * registration (`baseSettings`), so the resolved settings value is normally the
- * effective one and must be taken *verbatim* — including the empty string.
- * Clearing a template field in the Web panel is how a user disables that
- * injection, and a `length > 0` guard here would silently fall back to the
- * composition text, making the injection impossible to turn off from the UI
- * (found by browser verification on 2026-09-12).
+ * The two live template fields deliberately carry no schema default (see
+ * `settings.ts`), so "unset" stays distinguishable from "set to empty": an
+ * unset field falls through to the composition's own `wrapUpPrompt` /
+ * `resumePrompt`, while a present value must be taken *verbatim* — including the
+ * empty string. Clearing a template field in the Web panel is how a user
+ * disables that injection, and a `length > 0` guard here would silently fall
+ * back to the composition text, making the injection impossible to turn off
+ * from the UI (found by browser verification on 2026-09-12).
  */
 function pickTemplate(settingValue: string | undefined, configValue: string | undefined, builtin: string): string {
   if (settingValue !== undefined) return settingValue
@@ -294,11 +327,12 @@ async function existingFile(candidate: string | undefined): Promise<string | und
  * Install the guard's listeners.
  * @param ctx - plugin context; listeners are scoped to it and disposed with it.
  * @param config - validated {@link Config}; schemastery's `.default()` guarantees
- *   the fields are set after validation. An invalid ratio never throws: the
- *   guard reports it and falls back to the default, so a misconfiguration can
- *   never take the host process down.
+ *   the plain fields are set after validation and the live fields arrive as
+ *   stable references. An invalid ratio never throws: the guard reports it and
+ *   falls back to the default, so a misconfiguration can never take the host
+ *   process down.
  */
-export function apply(ctx: Context, config: Config = {}): void {
+export function apply(ctx: Context, config: Config): void {
   // One sink for the whole plugin: cordis logger plus the console line that is
   // actually observable in a composition with no logger exporter.
   const log = createLogSink(ctx.logger)
@@ -313,43 +347,40 @@ export function apply(ctx: Context, config: Config = {}): void {
     thresholdRatio = 0.85
   }
 
-  // The composition base layer: config-derived templates plus the built-in
-  // defaults, so `scope.get()` alone already answers "settings > config >
-  // default" and a composition that never mounts a settings provider degrades
-  // to exactly the config it declared.
-  const baseSettings: ContextGuardSettingsValue = {
-    ...SETTINGS_DEFAULTS,
-    wrapUpPromptTemplate: wrapUpPrompt,
-    resumePromptTemplate: resumePrompt,
-  }
-  let settingsValue: Partial<ContextGuardSettingsValue> = baseSettings
-  let thresholds: ThresholdOverrides | undefined
-
-  // The settings seam is optional: without a provider the guard falls back to
-  // the config's percentage ratio. Registration waits on the settings service
-  // via ctx.inject (declarative, retried on service changes) rather than
-  // reading ctx.get('settings') once at apply time — the eager read could run
-  // before the settings provider finished loading and silently skip
-  // registration forever.
-  ctx.inject(['settings'], (settingsCtx) => {
-    const scope = settingsCtx.settings.register(SETTINGS_NAMESPACE, settingsSchema, {
-      base: baseSettings,
-    })
-    settingsValue = scope.get()
-    thresholds = overridesOf(settingsValue)
-    scope.watch(() => {
-      settingsValue = scope.get()
-      thresholds = overridesOf(settingsValue)
-    })
-    settingsCtx.effect(() => () => {
-      settingsValue = baseSettings
-      thresholds = undefined
-    }, 'context-guard settings source')
-  })
-
-  /** The resolved settings value with every absent field defaulted. */
+  /**
+   * The resolved settings value: "user override > composition config > built-in
+   * default", read fresh on every call.
+   *
+   * Since 0.1.7 there is nothing to register and nothing to watch: the knobs are
+   * the row's own `Volatile` fields, so `.get()` already returns the entry's
+   * effective value — the profile patch the Web panel writes *is* the entry
+   * config — and a panel save is visible on the next read without a remount.
+   * A composition that mounts no settings service therefore keeps working
+   * exactly as before, rather than degrading to a config-only base layer.
+   *
+   * Only the two templates are resolved through {@link pickTemplate}: they have
+   * no schema default, so an unset field must fall through to the composition's
+   * own `wrapUpPrompt` / `resumePrompt` text, and an explicit empty string must
+   * survive verbatim (that is how the panel disables an injection).
+   */
   function settings(): ContextGuardSettingsValue {
-    return withDefaults(settingsValue)
+    return withDefaults({
+      defaultThresholdTokens: config.defaultThresholdTokens.get(),
+      providerThresholds: config.providerThresholds.get(),
+      digestEnabled: config.digestEnabled.get(),
+      digestMaxTokens: config.digestMaxTokens.get(),
+      digestTargetRatio: config.digestTargetRatio.get(),
+      digestCarryForward: config.digestCarryForward.get(),
+      digestTokenEstimator: config.digestTokenEstimator.get(),
+      writeRawArchive: config.writeRawArchive.get(),
+      rawExcludeInjected: config.rawExcludeInjected.get(),
+      archiveLayout: config.archiveLayout.get(),
+      resumeEscalation: config.resumeEscalation.get(),
+      resumeWindowMinutes: config.resumeWindowMinutes.get(),
+      resumeMaxPerWindow: config.resumeMaxPerWindow.get(),
+      resumePromptTemplate: pickTemplate(config.resumePromptTemplate.get(), resumePrompt, DEFAULT_RESUME_PROMPT),
+      wrapUpPromptTemplate: pickTemplate(config.wrapUpPromptTemplate.get(), wrapUpPrompt, DEFAULT_WRAP_UP_PROMPT),
+    })
   }
 
   /**
@@ -358,8 +389,8 @@ export function apply(ctx: Context, config: Config = {}): void {
    * percentage ratio converted against the model's context window.
    */
   function thresholdTokensFor(provider: string, contextWindow: number): number {
-    const overrides = thresholds
-    const explicit = overrides?.providerTokens.get(provider) ?? overrides?.defaultTokens ?? 0
+    const overrides = overridesOf(settings())
+    const explicit = overrides.providerTokens.get(provider) ?? overrides.defaultTokens
     return explicit > 0 ? explicit : Math.round(contextWindow * thresholdRatio)
   }
 
@@ -378,11 +409,6 @@ export function apply(ctx: Context, config: Config = {}): void {
       states.set(session, state)
     }
     return state
-  }
-
-  /** A `notice`-form plugin source carrying one one-line account. */
-  function pluginSource(summary: string): { kind: 'plugin'; plugin: 'context-guard'; form: 'notice'; summary: string } {
-    return { ...PLUGIN_SOURCE, form: 'notice', summary }
   }
 
   /**
@@ -475,7 +501,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           notePath: note.path,
         }),
       }],
-      source: pluginSource(WRAP_UP_SUMMARY),
+      source: noticeSource(WRAP_UP_SUMMARY),
     })
     state.warned = true
     logInfo(log, '', 'wrap-up-queued', {
@@ -765,7 +791,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       const owner = goalTurnOwner(agent)
       const message = createUserMessage({
         content: [{ type: 'text', text: decision.prompt }],
-        source: pluginSource(decision.suppress ? RESUME_HOLD_SUMMARY : RESUME_SUMMARY),
+        source: noticeSource(decision.suppress ? RESUME_HOLD_SUMMARY : RESUME_SUMMARY),
       })
       if (decision.suppress) {
         logWarn(log, 'resume', 'suppressed', {

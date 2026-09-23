@@ -31,8 +31,12 @@ function fakeSession(events: FakeEvent[], tools?: string[]): Session {
   } as unknown as Session
 }
 
-/** One `user/message` event. */
-function userMessage(seq: number, time: number, kind: 'user' | 'plugin', text: string): FakeEvent {
+/**
+ * One `user/message` event: the human's, or one of the guard's own injected
+ * notices (which carry this plugin's own source kind — V4 has no shared
+ * `plugin` kind to borrow).
+ */
+function userMessage(seq: number, time: number, kind: 'user' | 'guard', text: string): FakeEvent {
   return {
     type: 'user/message',
     seq,
@@ -40,7 +44,7 @@ function userMessage(seq: number, time: number, kind: 'user' | 'plugin', text: s
     data: {
       role: 'user',
       content: [{ type: 'text', text }],
-      source: kind === 'user' ? { kind: 'user' } : { kind: 'plugin', plugin: 'context-guard', form: 'notice', summary: text },
+      source: kind === 'user' ? { kind: 'user' } : { kind: 'context-guard', form: 'notice', summary: text },
     },
   }
 }
@@ -95,9 +99,9 @@ describe('compactionPace', () => {
     expect(pace.autoTotal).toBe(4)
   })
 
-  it('treats a plugin message as no anchor', () => {
+  it('treats a guard notice as no anchor', () => {
     const session = fakeSession([
-      userMessage(1, now - 1 * minute, 'plugin', '上下文已压缩，已恢复任务'),
+      userMessage(1, now - 1 * minute, 'guard', '上下文已压缩，已恢复任务'),
       compactionEnd(2, now),
     ])
     expect(compactionPace(session, now, 30).autoInWindow).toBe(1)
@@ -133,10 +137,10 @@ describe('pendingTodos', () => {
 })
 
 describe('lastHumanIntent', () => {
-  it('skips plugin messages and clips the result', () => {
+  it('skips non-human messages and clips the result', () => {
     const session = fakeSession([
       userMessage(1, 0, 'user', '第一个请求'),
-      userMessage(2, 0, 'plugin', '不要看这条'),
+      userMessage(2, 0, 'guard', '不要看这条'),
       userMessage(3, 0, 'user', 'x'.repeat(500)),
     ])
     const intent = lastHumanIntent(session, 40)

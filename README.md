@@ -6,9 +6,10 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 
 ## 设置面板（Web UI）/ Settings UI
 
-浏览器端 `settings.section`「**上下文守卫**」，三组共 15 项，保存即生效（host 侧实时 `watch`
-`context-guard` settings 命名空间）。更新是**稀疏 patch**（只发本面板拥有的字段），不会碰其他插件
-的键。
+浏览器端 `settings.section`「**上下文守卫**」，三组共 15 项，保存即生效。这 15 项就是本行
+（profile entry `context-guard`）的**实时配置字段**：面板经 `remote.settings.update` 把稀疏 patch
+（只发本面板拥有的字段）写进 profile patch，host 侧读的是这些字段的 `Volatile` 引用，因此下一次
+判断就用新值，无需重挂行、也没有 `watch`。
 
 1. **压缩阈值** —— 默认阈值（tokens）+ 按供应商覆盖的阈值表（供应商列表取自 `remote.llm.listProviders()`；
    `llm` remote 不可用时降级为手输）。
@@ -19,7 +20,7 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 字段语义见 §[设置项](#设置项--settings)。设置优先级处处一致：
 
 ```
-settings 用户层  >  组合配置（cordis.patch.yml 的 config）  >  内置默认值
+本行实时字段（面板保存的值）  >  组合配置（cordis.patch.yml 的 config）  >  内置默认值
 ```
 
 ## 功能 / Features
@@ -180,7 +181,7 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `rawExcludeInjected` | boolean | `false` | 开启 `writeRawArchive` 时，归档中也剔除宿主重发的注入内容 |
 | `archiveLayout` | `session` \| `flat` | `session` | `flat` 为旧行为（平铺，无会话隔离） |
 
-> 引擎行上这几个键是**中间优先层**：settings 用户层 > 引擎行 config > 内置默认。引擎行是否显式写了
+> 引擎行上这几个键是**中间优先层**：本行的实时字段 > 引擎行 config > 内置默认。引擎行是否显式写了
 > 任一归档键，会记入 `context-guard/digest: knobs source=settings|config|default` 日志。
 
 示例：
@@ -194,7 +195,9 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 
 ## 设置项 / Settings
 
-`context-guard` 命名空间（`~/.dsh/settings.yaml` 顶层，web/staging 共享；无 profile 级覆盖文件）。
+本行的实时字段，存在**当前 profile 的 Cordis patch** 里（每个 profile 各自一份）。旧版留在
+`~/.dsh/settings.yaml` 顶层的 `context-guard` 段会被 0.1.7 的 settings 服务**导入一次**（按段名写进
+同名 entry，随后文件改名 `settings.yaml.imported`）。
 面板可改的全部字段：
 
 | 字段 | 默认 | 说明 |
@@ -215,8 +218,8 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `resumePromptTemplate` | `''` | 续跑提示词；**清空 = 关闭该注入** |
 | `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入** |
 
-> 组合层（`cordis.patch.yml` 的 `wrapUpPrompt`/`resumePrompt`）在注册时即写入 settings 的 **base 层**，
-> 所以面板读到的就是「当前生效文本」。解析结果（**含空字符串**）是权威值：清空字段并保存即可关掉对应
+> 组合层（`cordis.patch.yml` 的 `wrapUpPrompt`/`resumePrompt`，0.1.7 之前唯一的键名）是这两个实时字段的
+> **回落层**：字段未设时用组合层文本，字段一设（**含空字符串**）就以它为准。清空字段并保存即可关掉对应
 > 注入，不会被组合层文本悄悄顶回来（该语义由 `tests/context-guard.spec.ts` 的 template precedence 用例
 > 守住；2026-09-12 浏览器验证时发现旧实现做不到，已修）。
 
@@ -347,9 +350,9 @@ npm run verify      # 三者全跑
 - `.handoff/` 根下 299 份历史 flat 归档**不迁移**（无法按会话归属），新版不再写根 `latest.txt`。
   旧的收尾笔记（`<日期>-<主题>.md`）也留在根下不动：**0.3.4 起新笔记写进 `sessions/<会话id>/`**，
   根目录不再增长。
-- 接力笔记的目录由守卫按 `<cwd>/.handoff` 默认基线 + settings 的 `archiveLayout` 算出；
-  若压缩引擎行单独配了别的 `archiveDir`（不在 settings 命名空间里），笔记与归档会分处两地。
-  **旁挂归档同理**：它读 settings 的 `archiveLayout`，读不到引擎行的 `archiveDir`/`epochPrefix`。
+- 接力笔记的目录由守卫按 `<cwd>/.handoff` 默认基线 + 本行实时字段 `archiveLayout` 算出；
+  若压缩引擎行单独配了别的 `archiveDir`（不在本行的实时字段里），笔记与归档会分处两地。
+  **旁挂归档同理**：它读本行的 `archiveLayout`，读不到引擎行的 `archiveDir`/`epochPrefix`。
 - 只归档**摘要式压缩**（`compaction/summary`）。同族里模型无关的 `compaction/prune` 不写归档 ——
   它是纯剪枝、没有摘要区间，混进同一套 `epoch-N` 编号会让 digest 与序号错位。
 - 会话没有 `cwd` 时不旁挂写盘（`.handoff` 会相对宿主进程的工作目录解析），只记一行
