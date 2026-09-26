@@ -230,6 +230,30 @@
   压缩期排 round」，必须在监听器里 `queueMicrotask(() => agent.send(...))`，否则消息根本进不去
   inbox（实测症状：`agent/inbox/spliced` 里完全没有那次插入）。
 
+## 收尾提醒的回程票（0.5.0）
+
+- **叫停型注入必须自己认账**：收尾提醒让模型收尾停轮，而唯一会把它接回来的是 `agent/status idle` 上的
+  自动压缩。两处都会漏：①提醒排队（`step/end`）与折叠（下一个 `agent/pre-step`）之间，别人的
+  `compaction-basic` 压力通道**就跑在同一个 `agent/pre-step` 上**（它 `await` 完才轮到折叠，所以压缩
+  已落盘）；②空闲那一刻的读数可能已经和排队时不同。漏了的结果不是「少提醒一次」，而是**会话停在半路
+  没人叫醒**。所以折叠前要复检（`state.pendingReminder !== reminder` 的对象引用比对 + `reminderOutlived()`
+  复测），空闲那一跳在阈值以下时要恢复（`DEFAULT_STRANDED_RESUME_PROMPT`）。
+- **`reminded` 不能跟着阈值回落一起清**：`warned`（本周期已排队）随回落复位是对的，但「提醒是否真的
+  送到了模型」是另一件事 —— 实测把两者合成一个标记时，晚到的 `step/end` 评估会在空闲判断之前把
+  「提醒已送达但没人接」抹掉，恢复逻辑永远不触发。清 `reminded` 的只有三处：守卫自己的 `compactNow()`
+  成功、恢复已发出、来了 `source.kind === 'user'` 的人类消息。**外域压缩（别人压的）不清它** ——
+  那次压缩可能就是「提醒送达后压了、但没叫醒会话」的那一跳。
+- **`handleIdle` 必须 `await state.evaluation`**：`step/end` 评估是异步链，空闲那一跳读写的正是它写下的
+  周期标记。实测症状：测试里在 `turn/end` 改掉阈值后，空闲判断先跑、晚到的 step-end 评估后跑，`reminded`
+  被先读后写，看起来像「标志无缘无故是 false」。`agent/status idle` 与 `turn/end` 的先后由 dsh 决定。
+- **瀑布监听器只准取一次 `next()`**：把 `next()` 放进 `try`、在 `catch` 里再调一次，等于下游 hook 抛错时
+  **重跑整条瀑布**（日志、副作用全来两遍）。正确写法是先 `const decision = await next()` 接住，再让本钩子
+  自己的逻辑失败降级为 `decision`，下游异常向外抛。
+- **测试技术**：要复现「轮内压缩」（无 maintenance 阶段、无空闲跳），让 stub 引擎在 `compactIfNeeded` 里
+  直接落一次真实事务（`StubCompactionEngine.compactOnStepPressure`），再用测试自己的 `agent/pre-step`
+  监听器（注册在守卫之后 = 瀑布下游）触发 —— 守卫的折叠在 `await next()` 的**回程**上跑，所以时序是
+  确定的，不需要 sleep。
+
 ## 日志
 
 - **字段不含正文**：只有路径、计数、名称；`context-guard: knobs source=settings|config|default` 是排查
