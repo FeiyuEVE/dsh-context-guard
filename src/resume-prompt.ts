@@ -15,15 +15,52 @@
  * @module dsh-context-guard/resume-prompt
  */
 
-/** Default wrap-up reminder: finish, externalize state, hand off, stop. */
+/**
+ * Default wrap-up reminder: finish what cannot be interrupted, externalize
+ * state, hand off, then stop.
+ *
+ * The wording is deliberately *soft* and states the real reason (a long context
+ * costs more per request) instead of a hard limit it did not measure: the guard
+ * fires on a fraction of the window, and the reminder can land next to an
+ * automatic goal round whose own instruction is "keep going". "Stop now" beside
+ * "continue" is what makes a model abandon half a round; "finish the
+ * uninterruptible part, do not start anything new, then hand off" composes with
+ * either instruction and still delivers the cost signal.
+ */
 export const DEFAULT_WRAP_UP_PROMPT =
-  '当前会话上下文已接近上限，即将被截断为「本回复 + 归档指针」。请立即收尾：\n'
+  '当前上下文已经很长了 —— 这不是因为碰到了上限，而是因为上下文越长，后续每次请求越贵。\n'
+  + '所以请收尾，但不是必须立刻停手：先把**不适合中断**的事情做完（正在进行的编辑、'
+  + '已经发出还没拿到结果的命令、当次工具调用的收尾），不要再展开新的探索或大范围重读。然后：\n'
   + '1) 若任务尚未完成，把关键状态写入 `{{notePath}}`；该文件**第一行标题**必须是 '
   + '`# 第 {{epoch}} 次压缩 · 接力笔记 · <一句话主题>`（本会话第 {{epoch}} 次压缩），'
   + '正文写涉及的文件路径、已做决策、未完成项、下一步，并在下面的接力总结中给出该路径；\n'
   + '2) 用 todo_write 把未完成项写成待办清单（它会被自动摘要带进下一段上下文）；\n'
   + '3) 在回复末尾输出一段 ≤200 字、自包含的接力总结（截断后它将是上下文里唯一的对话帧）；\n'
-  + '4) 不要启动新的子任务或继续深入探索，完成后停止。'
+  + '4) 收尾完成后停下即可。'
+
+/**
+ * Default revival prompt for a session the wrap-up reminder stopped and no
+ * compaction followed.
+ *
+ * The reminder tells the model to stop; the guard's own idle compaction is what
+ * normally reopens the task. When that leg does not happen — the reading that
+ * produced the reminder had already gone stale, or the compaction found no range
+ * to cut — nothing else would ever wake the session again, so the guard has to
+ * undo its own reminder or the task dies mid-flight.
+ *
+ * It is phrased as a condition, not an order, so a session that really did
+ * finish after wrapping up is not pushed into new work: one cheap turn settles
+ * either answer.
+ *
+ * Deliberately built-in rather than a sixteenth settings field: it repairs a
+ * state the guard should not have produced, and a knob invites configuring the
+ * safety net away. `resumeAfterCompact: false` remains the way to refuse every
+ * automatic wake-up.
+ */
+export const DEFAULT_STRANDED_RESUME_PROMPT =
+  '上一条收尾提醒是按当时的上下文读数发出的，此后并没有发生压缩。'
+  + '如果任务还没做完，请继续做完，不要重新探索已确认的内容；'
+  + '如果已经收尾完成，用一句话说明结论即可。'
 
 /**
  * Default continuation prompt: pick the task back up from the digested state.

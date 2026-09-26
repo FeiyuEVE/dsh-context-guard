@@ -175,6 +175,17 @@ describe('buildWrapUpPrompt', () => {
     expect(prompt).toContain('- 未完成任务 A')
   })
 
+  it('asks softly: wrapping up is not a hard stop, and the reason given is cost', () => {
+    // The reminder fires on a fraction of the window and can land in the same
+    // step as an automatic goal round whose own instruction is "keep going", so
+    // it must not read as "stop now" beside it.
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('不是必须立刻停手')
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('不适合中断')
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('越贵')
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('立即收尾')
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('接近上限')
+  })
+
   it('names the session-scoped note and its compaction number', () => {
     const prompt = buildWrapUpPrompt(DEFAULT_WRAP_UP_PROMPT, { todos: [], ...note })
     // The path is the session's own directory, not the flat .handoff/ inbox.

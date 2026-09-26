@@ -9,13 +9,24 @@
  *    context window. Above the threshold the guard queues a wrap-up reminder
  *    that the next `agent/pre-step` folds into the entering messages, so the
  *    model sees it before its very next action and wraps the turn up instead
- *    of extending it.
+ *    of extending it. The reminder is only folded while the reading behind it
+ *    still holds: a compaction that lands between the step end and the fold
+ *    (the preset's own `compaction-basic` pressure pass runs on that same
+ *    pre-step) voids it, and so does a pressure that has fallen back below the
+ *    threshold. A reminder about a context that no longer exists is worse than
+ *    no reminder: it stops a session the compaction just relieved.
  * 2. `agent/status` idle — when the agent stops and the session is still over
  *    the threshold, the guard runs `compaction.compactNow()` once per
  *    over-threshold episode. The engine is resolved per agent: a host-plane
  *    provider first, else the instance the agent's preset mounted behind its
  *    `isolate` realm (via the `agentPresets` seam), so preset-owned backends
  *    are reachable from this host-mounted guard.
+ *    A session the guard's own reminder stopped is otherwise stranded when
+ *    this leg does not happen (the reading had gone stale, or the backend found
+ *    nothing to cut): nothing else will ever wake it again. Below the threshold
+ *    — or when the session cannot be priced at all — the guard therefore
+ *    revives it with a conditional "continue if unfinished" message, unless a
+ *    goal round owns the session (the goal driver keeps that one alive itself).
  * 3. `compaction/end` — after a successful compaction of an idle agent, the
  *    guard queues a continuation prompt and wakes the driver, so the task
  *    resumes on the compacted surface instead of sitting idle. When an
@@ -74,6 +85,7 @@ import { noticeSource } from './notice.ts'
 import { archiveLocation, digestPointerCandidates, handoffNotePath } from './paths.ts'
 import {
   DEFAULT_RESUME_PROMPT,
+  DEFAULT_STRANDED_RESUME_PROMPT,
   DEFAULT_WRAP_UP_PROMPT,
   buildWrapUpPrompt,
   decideResume,
@@ -129,8 +141,8 @@ export interface Config extends ContextGuardSettingsFields {
   thresholdRatio?: number
   /**
    * Wrap-up reminder folded into the next step's messages when pressure
-   * exceeds the threshold (default prompts a quick finish and stop). Used when
-   * the live `wrapUpPromptTemplate` is unset.
+   * exceeds the threshold (default asks for a soft wrap-up that finishes
+   * in-flight work first). Used when the live `wrapUpPromptTemplate` is unset.
    */
   wrapUpPrompt?: string
   /**
@@ -141,7 +153,11 @@ export interface Config extends ContextGuardSettingsFields {
   resumePrompt?: string
   /** Whether an over-threshold idle session is compacted automatically (default `true`). */
   autoCompactOnIdle?: boolean
-  /** Whether a completed compaction resumes the idle agent (default `true`). */
+  /**
+   * Whether the guard may open a turn of its own to keep a stopped session
+   * alive (default `true`): the post-compaction continuation, and the revival
+   * of a session the wrap-up reminder stopped when no compaction followed.
+   */
   resumeAfterCompact?: boolean
   /**
    * Tool names that count as delegation-capable when the guard suggests
@@ -192,6 +208,8 @@ const WRAP_UP_SUMMARY = '上下文超过阈值，已提醒 agent 收尾'
 const RESUME_SUMMARY = '上下文已压缩，已恢复任务'
 /** One-line account of a suppressed resume for collapsed transcript rows. */
 const RESUME_HOLD_SUMMARY = '压缩过于频繁，已暂停自动续跑'
+/** One-line account of a revival after a wrap-up that no compaction followed. */
+const REVIVE_SUMMARY = '收尾后未发生压缩，已恢复任务'
 
 /**
  * Filename prefix shared by every artifact of one compaction: the side-car
@@ -272,6 +290,14 @@ function goalRound(source: UserMessage['source']): number | undefined {
 interface EpisodeState {
   /** A wrap-up reminder was queued this episode. */
   warned: boolean
+  /**
+   * That reminder actually reached a step, i.e. the model was told to wrap up.
+   *
+   * Distinct from {@link warned} on purpose: a reminder dropped at fold time
+   * (superseded by a compaction, or no longer above the threshold) never told
+   * the model anything, so the session it left alone must not be "revived".
+   */
+  reminded: boolean
   /** An idle-session compaction landed this episode. */
   compacted: boolean
   /** An idle-session compaction is in flight. */
@@ -401,6 +427,7 @@ export function apply(ctx: Context, config: Config): void {
     if (state === undefined) {
       state = {
         warned: false,
+        reminded: false,
         compacted: false,
         compacting: false,
         evaluation: Promise.resolve(),
@@ -483,6 +510,9 @@ export function apply(ctx: Context, config: Config): void {
     const pressure = await measurePressure(agent)
     if (pressure === undefined) return
     if (pressure.totalTokens < thresholdTokensFor(pressure.provider, pressure.contextWindow)) {
+      // The over-threshold episode ends here — but `reminded` survives it: a
+      // reminder the pressure has since fallen out from under is exactly the
+      // case the idle leg has to undo, so this reading must not erase it.
       state.warned = false
       state.compacted = false
       state.pendingReminder = undefined
@@ -714,6 +744,12 @@ export function apply(ctx: Context, config: Config): void {
         })
       return
     }
+    if (event.type === 'user/message' && event.data.source.kind === 'user') {
+      // A new human request owns the session: the episode's wrap-up is answered
+      // by the human taking over, so the guard must not revive it later.
+      stateOf(session).reminded = false
+      return
+    }
     if (event.type === 'compaction/summary') {
       // A `context-guard` summary is this plugin's own engine, which already
       // wrote the pair while it summarized — before the region was shadowed.
@@ -832,6 +868,20 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /**
+   * Whether the pressure behind one queued reminder has since fallen back below
+   * the threshold, i.e. the reminder is now asking for something the measured
+   * context no longer justifies.
+   *
+   * An unmeasurable session answers `false`: the guard cannot show that its own
+   * reading went stale, so the reminder it already decided on stands.
+   */
+  async function reminderOutlived(agent: Agent): Promise<boolean> {
+    const pressure = await measurePressure(agent)
+    return pressure !== undefined
+      && pressure.totalTokens < thresholdTokensFor(pressure.provider, pressure.contextWindow)
+  }
+
   // Fold a pending wrap-up reminder into the entering messages after the
   // claimed batch, so it reaches the very next request deterministically
   // (agent.inject() from an async step-end listener would miss the claim).
@@ -841,20 +891,37 @@ export function apply(ctx: Context, config: Config): void {
   // reminder pending. Any guard failure here degrades to the unmodified
   // decision, so the loop is never disturbed.
   ctx.on('agent/pre-step', async ({ agent, messages, step }, next): Promise<PreStepDecision> => {
+    const state = stateOf(agent.session)
+    await state.evaluation
+    const reminder = state.pendingReminder
+    // The decision belongs to the whole chain, so it is taken before this hook's
+    // own logic: a failure below must degrade to what the downstream hooks
+    // decided, and must not run them a second time.
+    const decision = await next()
+    if (reminder === undefined) return decision
     try {
-      const state = stateOf(agent.session)
-      await state.evaluation
-      const reminder = state.pendingReminder
-      if (reminder === undefined) return next()
-      const decision = await next()
       if (decision.kind === 'reject' || (step === 1 && decision.messages.length === 0)) return decision
+      // A compaction that landed while the downstream hooks ran (the preset's
+      // own pressure pass is one of them) already owns the relief, and the
+      // compaction/end hook voids the reminder for exactly that reason — so a
+      // reminder it dropped must not be folded from this stale local copy.
+      if (state.pendingReminder !== reminder) return decision
+      // Nothing voided it, but the pressure it was queued on may still have gone:
+      // a reading that no longer holds must not stop the session.
+      if (await reminderOutlived(agent)) {
+        state.pendingReminder = undefined
+        state.warned = false
+        logInfo(log, '', 'wrap-up-dropped', { agent: agent.id, reason: 'below-threshold' })
+        return decision
+      }
       state.pendingReminder = undefined
+      state.reminded = true
       const lastClaimedIndex = decision.messages.findLastIndex(message => messages.includes(message))
       const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, reminder)
       return { ...decision, messages: entered }
     } catch (error: unknown) {
       logWarn(log, '', 'pre-step-fold-failed', { agent: agent.id, error: String(error) })
-      return next()
+      return decision
     }
   })
 
@@ -870,17 +937,74 @@ export function apply(ctx: Context, config: Config): void {
   /** Warn once per plugin instance when no compaction provider is available. */
   let warnedNoProvider = false
 
+  /**
+   * Take this episode's unanswered reminder: whether the model was told to wrap
+   * up and the guard has not answered that with a compaction or a revival yet.
+   *
+   * Closing the episode's wrap-up half here is what keeps the revival to one
+   * per reminder, and it clears `warned` with it so a later over-threshold
+   * episode may warn again.
+   */
+  function takeStrandedWrapUp(state: EpisodeState): boolean {
+    const stranded = state.reminded
+    state.reminded = false
+    state.warned = false
+    return stranded
+  }
+
+  /**
+   * Reopen a session the guard's own wrap-up reminder stopped.
+   *
+   * The reminder tells the model to stop, and the idle compaction answers it;
+   * when that leg does not run — the reading behind the reminder had already
+   * gone stale, a backend compacted the turn instead, or the session cannot be
+   * priced at all — nothing else ever wakes the session, and the task would sit
+   * half-done until a human notices. The prompt is conditional, so a session
+   * that really did finish after wrapping up answers in one cheap turn.
+   *
+   * A goal-owned session is skipped: the goal driver reserves its own round and
+   * would read a second wake-up as a competing prompt for that boundary.
+   */
+  async function reviveStoppedWrapUp(agent: Agent): Promise<void> {
+    try {
+      if (!resumeAfterCompact) return
+      if (goalTurnOwner(agent) !== undefined) return
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: DEFAULT_STRANDED_RESUME_PROMPT }],
+        source: noticeSource(REVIVE_SUMMARY),
+      }))
+      logInfo(log, 'resume', 'revived', {
+        agent: agent.id,
+        promptTokens: estimateTextTokens(DEFAULT_STRANDED_RESUME_PROMPT, settings().digestTokenEstimator),
+      })
+    } catch (error: unknown) {
+      logWarn(log, 'resume', 'revive-failed', { agent: agent.id, error: String(error) })
+    }
+  }
+
   /** Compact one idle over-threshold session, once per episode. */
   async function handleIdle(agent: Agent): Promise<void> {
     const state = stateOf(agent.session)
     if (state.compacting) return
     state.compacting = true
     try {
+      // The step that just ended may still be evaluating; its verdict owns the
+      // episode flags this leg reads and writes.
+      await state.evaluation
       const pressure = await measurePressure(agent)
-      if (pressure === undefined) return
+      if (pressure === undefined) {
+        // The session cannot be priced, so this leg can neither compact nor
+        // prove the reminder was wrong; a session the guard itself stopped is
+        // still the guard's to reopen.
+        if (takeStrandedWrapUp(state)) await reviveStoppedWrapUp(agent)
+        return
+      }
       if (pressure.totalTokens < thresholdTokensFor(pressure.provider, pressure.contextWindow)) {
-        state.warned = false
+        state.pendingReminder = undefined
         state.compacted = false
+        // Below the threshold nothing will compact or resume this session, so a
+        // reminder that stopped it has to be undone here.
+        if (takeStrandedWrapUp(state)) await reviveStoppedWrapUp(agent)
         return
       }
       if (!autoCompactOnIdle || state.compacted) return
@@ -906,6 +1030,9 @@ export function apply(ctx: Context, config: Config): void {
       const result = await compaction.compactNow(agent, compactionSignal)
       if (result !== null) {
         state.compacted = true
+        // The guard answered its own reminder: this session is running again on
+        // the compacted surface, so the idle leg has nothing to revive.
+        state.reminded = false
         logInfo(log, '', 'idle-compacted', {
           agent: agent.id,
           tokens: pressure.totalTokens,

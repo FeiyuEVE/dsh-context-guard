@@ -28,11 +28,18 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 每会话一个闭环，由四个事件触发（各自有开关）：
 
 1. **hook `step/end`** —— 步骤结束时评估会话上下文（`tokenMeter` 测量 / 路由模型的 `contextWindow`）。
-   超过阈值、且该步骤仍欠模型一次请求（assistant 消息带工具调用）时，把「尽快收尾」提醒折叠进
+   超过阈值、且该步骤仍欠模型一次请求（assistant 消息带工具调用）时，把收尾提醒折叠进
    下一步的进入消息，agent 看到后收尾并停轮；同一超阈值周期只提醒一次。
+   **折叠前会再核一次这条提醒还成不成立**：这中间发生的压缩（preset 自己的 `compaction-basic`
+   压力通道就跑在同一个 `agent/pre-step` 上）会作废它，读数已经回落到阈值以下也会被丢弃 ——
+   拿一条过期的读数去叫停，比不提醒更糟。
 2. **hook `agent/status` idle** —— agent 停下后再次评估；仍超阈值则执行
    `compaction.compactNow()`（引擎解析见 §[容错设计](#容错设计)），每个超阈值周期只压缩一次
    （防止压缩-续跑死循环）。
+   **提醒已经送达、压缩这条路却没走成时（读数过期、后端没找到可裁区间、会话根本量不出占用），
+   守卫在这里把这次停摆救回来**：阈值以下（或量不出占用）而 agent 已停，说明那条提醒的根据不在了，
+   守卫用一条**条件式**消息重新开轮（「任务没做完就继续，做完了就一句话说明」）。goal 拥有这一轮
+   时不插手 —— goal driver 自己会排下一轮。
 3. **hook `compaction/end`** —— 压缩成功（无 `error`）且 agent 空闲时，**按压缩频率分级**渲染续跑
    提示并唤醒，在压缩后的表层上续跑。失败、agent 运行中、或频率超上限时按规则不唤醒。
    **通道由「谁拥有这一轮」决定**：会话没有在续跑的 goal 时用 `followup()`（进 `next-turn`，守卫自己
@@ -95,7 +102,8 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
      代价：调用方每次压缩多等几毫秒；归档盘卡住会拖住压缩调用方。写盘一律 tmp + `rename`，
      不会留半截文件。（对比 0.3.5：那时是 fire-and-forget，落盘只是**通常**早于替换。）
   2. 路径只能靠**续跑提示**进上下文：checkpoint 是别人的摘要，不会带我们的路径。关掉
-     `resumeAfterCompact`、agent 非空闲、或下一次压缩裁掉那条消息时，模型看不到路径（文件仍在磁盘上）。
+     `resumeAfterCompact`、agent 非空闲（压缩发生在轮内时由那一轮自己继续）、或下一次压缩裁掉那条
+     消息时，模型看不到路径（文件仍在磁盘上）。
 
 ### 分级续跑
 
@@ -115,7 +123,7 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 - 委派工具只有在 `requestHeader().tools` 里**确实存在**时才会被点名，不会建议一个不存在的工具。
 - L3 抑制**与 `resumeEscalation` 开关无关**，始终生效 —— 它是防「压缩—续跑空转」烧 token 的安全阀。
 
-所有注入内容都是带插件 source（`{ kind: 'plugin', plugin: 'context-guard' }`）的 user 角色消息，
+所有注入内容都是带插件自己的 source（`{ kind: 'context-guard', form: 'notice' }`）的 user 角色消息，
 因此在会话日志里是持久的、可重建的（模型可见 ⟺ 已记录）。
 
 ## 安装 / Install
@@ -161,7 +169,7 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `wrapUpPrompt` | string | 内置中文收尾提醒 | 收尾提示模板；空字符串禁用 hook 1 |
 | `resumePrompt` | string | 内置中文续跑提示 | 续跑提示模板；空字符串禁用 hook 3 |
 | `autoCompactOnIdle` | boolean | `true` | 空闲且超阈值时自动压缩（hook 2 开关） |
-| `resumeAfterCompact` | boolean | `true` | 压缩成功后自动续跑（hook 3 开关） |
+| `resumeAfterCompact` | boolean | `true` | 守卫可否自己开轮保住停下来的会话：压缩成功后自动续跑（hook 3），以及收尾提醒后没有压缩时的停摆恢复（hook 2 末尾） |
 | `delegationTools` | string[] | `['subagent','subagent_fork','workflow','ralph']` | 视为「可委派」的工具名；只在与请求头求交后才会被 `L2` 点名 |
 
 压缩引擎行（`ArchiveCutEngine`，即 `./compaction` 子路径）字段 = `compaction-basic` 的全部策略键
@@ -216,7 +224,7 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `resumeWindowMinutes` | `30` | 统计窗口 |
 | `resumeMaxPerWindow` | `5` | 窗口内自动压缩上限（达到即 L3 不唤醒） |
 | `resumePromptTemplate` | `''` | 续跑提示词；**清空 = 关闭该注入** |
-| `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入** |
+| `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入**。内置文本是**柔和**版：说明「不是碰到了上限，而是上下文越长越贵」，要求先把不适合中断的事做完、别开新探索，收尾后停下 |
 
 > 组合层（`cordis.patch.yml` 的 `wrapUpPrompt`/`resumePrompt`，0.1.7 之前唯一的键名）是这两个实时字段的
 > **回落层**：字段未设时用组合层文本，字段一设（**含空字符串**）就以它为准。清空字段并保存即可关掉对应
@@ -283,11 +291,22 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
 ## 行为语义 / Behavior
 
 - **每周期一次**：`warned` / `compacted` 标记在上下文回落到阈值以下时复位；压缩后若仍超阈值不会重复
-  压缩，避免无限循环。
+  压缩，避免无限循环。`reminded`（提醒是否真的送到了模型）另外记账：它只在**守卫自己答上了这条提醒**
+  时清掉 —— 空闲压缩成功、或停摆恢复已发出、或来了新的人类消息。阈值回落本身不清它，否则「读数变了
+  但没人叫醒会话」这件事就没人记得了。
 - **收尾提醒的确定性注入**：`step/end` 评估是异步的，而循环会立即领取下一步的 inbox 批次
   （`agent.inject()` 会错过领取），因此提醒通过 `agent/pre-step` waterfall 折叠进进入消息，保证下一次
   请求必达；工具结果不经过 inbox（由日志派生模型历史），工具延续步骤的进入批次可能为空，此时提醒
   单独作为该步骤的进入消息。
+- **收尾提醒投递前复检**（0.5.0 起）：提醒在 `step/end` 排队、到下一个 `agent/pre-step` 才折叠进上下文，
+  中间可能已经发生压缩（preset 自己的 `compaction-basic` 压力通道就在同一个 `agent/pre-step` 上），
+  读数也可能已经回落。折叠前因此再看两件事：这条提醒是否已被 `compaction/end` 作废（拿的是同一个对象
+  引用比对），以及当前占用是否仍在阈值以上。任一不成立就丢弃并复位本周期，让后续步骤可以重新提醒。
+- **停摆恢复**（0.5.0 起）：提醒的本质是叫停，而唯一会把它接回来的是空闲压缩那一跳。这一跳没发生时
+  （读数过期、后端 `compactNow()` 返回 `null`、会话量不出占用），守卫用一条**条件式**消息重新开轮
+  （「任务没做完就继续；做完了就一句话说明」），不然任务会停在半路等人发现。goal 拥有这一轮时不插手；
+  `autoCompactOnIdle: false` 时不恢复（那时超阈值分支会在恢复之前就返回，用户明确关掉了自动介入）；
+  `resumeAfterCompact: false` 时也不恢复。
 - **压缩失败**：`compaction/end` 带 `error` 时不续跑，仅记日志。
 - **不与 goal round 争 `next-turn`**（0.4.6 起）：`next-turn` 是「申请一轮」的通道，goal driver 把落在那里的
   任何外来消息读成竞争提示 —— 它会把已排队的 round 标 `stale`，循环于是开一轮又被自己的 pre-step 拒掉
@@ -345,7 +364,13 @@ npm run verify      # 三者全跑
   会话日志里没有）。两者都读不到时守卫退回 `followup()` —— 即 0.4.5 及以前的行为，不会更糟。
   goal 处于 paused / blocked / complete / disarmed / 轮次用尽时**不算**拥有这一轮，守卫照常自己唤醒，
   否则「goal 停了，会话也跟着停住」。
-- 收尾是「提示性停止」：通过提醒引导 agent 自行收尾停轮，不强制中断轮次。
+- 收尾是「提示性停止」：通过提醒引导 agent 自行收尾停轮，不强制中断轮次。内置文本因此不写「立即停止」：
+  它可能和**同一个 step 里 goal round 的「继续」**撞在一起（提醒就折在 goal round 后面），柔和措辞是
+  让两者共存的手段 —— 先把不适合中断的事做完、别开新探索，随后收尾。
+- **轮内压缩时续跑提示会被丢弃**：`compaction/end` 时若非空闲（压缩发生在轮内，例如别人在 `agent/pre-step`
+  上的压力通道），那一轮自己会继续，守卫不插话，此时归档路径这一轮看不到。空闲压缩路径不受影响
+  （`compactNow` 跑在 maintenance 阶段，`agent.status` 仍是 `idle`）。
+- **压缩 `null` 时不重试**：`compactNow()` 返回 `null`（没有安全可裁区间）时本周期不再尝试压缩，只记日志。
 - digest 是**事实清单而非语义摘要**：它不试图理解内容，模型需要推理脉络时仍要 `read` 完整归档。
 - `.handoff/` 根下 299 份历史 flat 归档**不迁移**（无法按会话归属），新版不再写根 `latest.txt`。
   旧的收尾笔记（`<日期>-<主题>.md`）也留在根下不动：**0.3.4 起新笔记写进 `sessions/<会话id>/`**，

@@ -467,6 +467,124 @@ describe('context-guard failure and configuration paths', () => {
   })
 })
 
+/*
+ * The wrap-up reminder is a one-way instruction to stop, so it is only worth
+ * delivering while the reading that produced it still holds. Two things can
+ * void it between the step end that queued it and the pre-step that folds it:
+ * a compaction landing under it, and the pressure itself falling back below the
+ * threshold. Either way the reminder is dropped, and a session the reminder did
+ * stop — with no compaction behind it — is revived rather than left for dead.
+ */
+describe('the wrap-up reminder is re-checked before it is delivered', () => {
+  it('drops a reminder a compaction landed under, instead of stopping the session', async () => {
+    const { ctx, agent, compaction } = await harness([
+      toolCallResponse('c1', 'probe', { q: 1 }),
+      textResponse('kept working'),
+    ])
+    // `compaction-basic` compacts from its own `agent/pre-step` hook; the stub
+    // plays that role here. Because the guard folds on the way out of the same
+    // waterfall, the compaction is already durable when it decides.
+    compaction!.compactOnStepPressure = true
+    ctx.on('agent/pre-step', async ({ agent: target, step }, next) => {
+      if (target === agent && step === 2) {
+        await compaction!.compactIfNeeded(agent, 'pressure', new AbortController().signal)
+      }
+      return next()
+    })
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(1) })
+
+    // The compaction landed inside the turn...
+    expect(compactionEndCount(agent)).toBe(1)
+    // ...so the reminder that was queued before it is stale and never reaches
+    // the model: a session the compaction just relieved must not be told to stop.
+    expect(guardMessages(agent).filter(m => m.text.includes('不适合中断'))).toEqual([])
+    expect(compaction!.compactNowCalls).toEqual([])
+    void ctx
+  })
+
+  it('drops a reminder whose reading no longer holds, and warns again on a later step', async () => {
+    const { ctx, agent, compaction, fiber } = await harness(
+      [
+        toolCallResponse('c1', 'probe', { q: 1 }),
+        toolCallResponse('c2', 'probe', { q: 2 }),
+        toolCallResponse('c3', 'probe', { q: 3 }),
+        textResponse('wrapped up'),
+        textResponse('continuing after compaction'),
+      ],
+    )
+    // Raise the threshold for exactly one fold, then put it back: the reminder
+    // queued on step 1 no longer describes the session when step 2 begins, so it
+    // is dropped — and dropping it resets the episode, so step 3 may warn again.
+    ctx.on('agent/pre-step', async ({ agent: target, step }, next) => {
+      if (target !== agent) return next()
+      if (step === 2) commitLive(liveField(fiber, 'defaultThresholdTokens'), 100_000)
+      if (step === 3) commitLive(liveField(fiber, 'defaultThresholdTokens'), 0)
+      return next()
+    })
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+
+    const reminders = guardMessages(agent).filter(m => m.text.includes('不适合中断'))
+    expect(reminders).toHaveLength(1)
+    // The one delivery is the step-3 warning, not the dropped step-1 one.
+    const thirdStepStart = [...agent.session.snapshotEvents()]
+      .filter(e => e.type === 'step/start' && e.data.turn === 1 && e.data.step === 3)
+      .map(e => e.seq)[0]!
+    expect(reminders[0]!.seq).toBeGreaterThan(thirdStepStart)
+    expect(compaction!.compactNowCalls).toEqual([1])
+    void ctx
+  })
+
+  it('revives a session its own reminder stopped when no compaction follows', async () => {
+    const { ctx, agent, compaction, fiber } = await harness([
+      toolCallResponse('c1', 'probe', { q: 1 }),
+      textResponse('wrapping up now'),
+      textResponse('resumed by the guard'),
+    ])
+    // The reminder lands on step 2; the reading then moves out from under it, so
+    // the idle leg finds nothing to compact — the exact case where the reminder
+    // would leave the task half-done with nothing left to wake it.
+    ctx.on('session/event', (session, event) => {
+      if (event.type !== 'turn/end' || session !== agent.session) return
+      commitLive(liveField(fiber, 'defaultThresholdTokens'), 100_000)
+    })
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+
+    const messages = guardMessages(agent)
+    expect(messages).toHaveLength(2)
+    expect(messages[0]!.text).toContain('不适合中断')
+    // The revival is conditional, so a session that really finished costs one turn.
+    expect(messages[1]!.text).toContain('如果任务还没做完')
+    expect(compaction!.compactNowCalls).toEqual([])
+    void ctx
+  })
+
+  it('leaves a goal-owned session to the goal driver instead of reviving it', async () => {
+    const { ctx, agent, compaction, fiber } = await harness(
+      [toolCallResponse('c1', 'probe', { q: 1 }), textResponse('wrapping up now')],
+      {},
+      300,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      { phase: 'active', activation: 'armed' },
+    )
+    ctx.on('session/event', (session, event) => {
+      if (event.type !== 'turn/end' || session !== agent.session) return
+      commitLive(liveField(fiber, 'defaultThresholdTokens'), 100_000)
+    })
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(1) })
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    // The goal driver reserves its own round: a second wake-up would compete for
+    // the boundary that round lives on, so the guard stays out.
+    expect(guardMessages(agent)).toHaveLength(1)
+    expect(nextTurnGuardInserts(agent)).toEqual([])
+    expect(compaction!.compactNowCalls).toEqual([])
+    void ctx
+  })
+})
+
 describe('resume escalation', () => {
   it('escalates the continuation prompt after a second compaction in the window', async () => {
     // Wide window so the guard never auto-triggers: both cuts are manual here,
@@ -743,7 +861,7 @@ describe('template precedence over the composition layer', () => {
     await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
     const messages = guardMessages(agent)
     // The reminder would normally fire on the tool-call step; only the resume lands.
-    expect(messages.filter(m => m.text.includes('接近上限'))).toEqual([])
+    expect(messages.filter(m => m.text.includes('不适合中断'))).toEqual([])
     expect(messages.some(m => m.text.includes('继续'))).toBe(true)
     expect(compaction!.compactNowCalls).toEqual([1])
     void ctx

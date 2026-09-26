@@ -9,8 +9,12 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
 
 1. `step/end`（经 `session/event` 分发）：超阈值且该步骤仍欠一次模型请求（assistant 带 tool-call）
    时，把收尾提醒排队，经 `agent/pre-step` 折叠进下一步进入消息；同一超阈值周期只提醒一次。
+   **折叠前复检**（0.5.0）：排队到折叠之间可能已经压过（别人的 `compaction-basic` 压力通道跑在同一个
+   `agent/pre-step` 上），读数也可能回落 —— 复检不成立就丢弃并复位本周期，见 `reminderOutlived()`。
 2. `agent/status` idle：仍超阈值则 `compaction.compactNow()`；同一超阈值周期只压缩一次
-   （防压缩-续跑死循环）。
+   （防压缩-续跑死循环）。**提醒已送达而这一跳没走成**（读数过期 / `compactNow()` 返回 `null` /
+   会话量不出占用）时，在阈值以下分支用条件式提示 `DEFAULT_STRANDED_RESUME_PROMPT` 重新开轮
+   （goal 拥有这一轮、`resumeAfterCompact: false`、`autoCompactOnIdle: false` 时都不恢复）。
 3. `compaction/end`：压缩无 `error`、开关开启且 agent 空闲时，按 **L0–L3 分级**渲染续跑提示并注入。
    通道按「谁拥有这一轮」选：**无 goal** → `agent.followup()`（`next-turn`，守卫开轮）；**有 goal**
    （`next-turn` 已排 goal round，或 `goals` 视图 armed+active 且未到轮次上限）→ `agent.steer()`
@@ -136,6 +140,17 @@ npm run verify      # typecheck && test && build（顺序固定）
   两者都读不到时退回 `followup()`。回归用例见 `tests/context-guard.spec.ts` 的
   `goal-owned post-compaction continuation`（把通道改回 `followup()` 该组会挂 3 条），教训见
   `docs/gotchas.md`「续跑注入通道与 goal」。
+- **收尾提醒是叫停，必须有回程票**（0.5.0 起）：提醒说「收尾并停下」，把它接回来的一跳只有空闲压缩。
+  所以 `EpisodeState` 分两个标记：`warned`（本周期已排队，防重复提醒，随阈值回落复位）与 `reminded`
+  （**真的送到了模型**，只在守卫答上它时清 —— 自家 `compactNow()` 成功、停摆恢复已发、或来了一条
+  `source.kind === 'user'` 的人类消息）。阈值回落**不清** `reminded`，否则「读数变了但没人叫醒会话」
+  就没人记得。改了这两条任一逻辑，先跑 `tests/context-guard.spec.ts` 的
+  `the wrap-up reminder is re-checked before it is delivered` 一组四例（把复检和恢复都摘掉会挂 3 例、
+  只摘恢复里的 goal 判据会挂第 4 例）。
+- **`agent/pre-step` 的瀑布决策只取一次**：折叠监听器先把 `next()` 的结果接住，再决定要不要插提醒 ——
+  下游 hook 抛错不能再调一次 `next()`（会二次执行整条链），本钩子自己的失败降级为那个已接住的结果。
+- **`handleIdle` 先 `await state.evaluation`**：`step/end` 的评估是异步的，空闲那一跳读写的正是它写下的
+  周期标记，不等它就会读到半路状态。
 - **日志一律走 `createLogSink`**（`ctx.logger` + console 双投递），字段不含正文。
 - **配置优先级处处一致**：`本行实时字段（面板值） > 组合 config > 内置默认`；解析结果含空字符串都必须照用。
 

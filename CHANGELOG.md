@@ -4,6 +4,84 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.5.0] - 2026-09-26
+
+### 变更
+
+- **默认收尾提示词改柔和**（`DEFAULT_WRAP_UP_PROMPT`）：不再写「上下文已接近上限 / 请立即收尾 / 完成后停止」，
+  改成说明**真实原因**（不是碰到上限，而是上下文越长、后续每次请求越贵）并要求「先把**不适合中断**的事
+  做完（正在进行的编辑、已发出没拿到结果的命令、当次工具调用的收尾），不要再开新探索，然后收尾」。
+  两个动因：
+  1. 阈值是窗口的一个比例（本机配置里是 `400000` 绝对阈值 / 1M 窗口 = 40%），说成「接近上限」是**假话**；
+  2. 提醒折进下一步时可能和 **`<goal_round>` 的「继续」同处一个 step** —— 一边说「立刻停」一边说
+     「继续做」会让模型半路丢下一个 round。柔和措辞与 goal round 共存，成本信号照旧送达。
+  占位符（`{{notePath}}`/`{{epoch}}`/`{{todos}}`）与接力笔记契约（首行标题格式）一字未动。
+- **收尾提醒投递前复检**：提醒在 `step/end` 排队、到下一个 `agent/pre-step` 才折叠进上下文，中间两件事
+  会让它过期 —— ①**已经压过**（`compaction-basic` 自己的压力通道就跑在同一个 `agent/pre-step` 上，
+  且 `compaction/end` 处理器本就会清掉待折提醒，但折叠监听器手里已抓住本地副本）；②**读数回落**到
+  阈值以下。现在折叠前两件都查：待折提醒是否已被 `compaction/end` 作废（同一对象引用比对），以及当前
+  占用是否仍在阈值以上；任一不成立就丢弃 + 复位本周期（后续步骤可重新提醒），并记
+  `wrap-up-dropped reason=below-threshold`。**拿过期的读数去叫停，比不提醒更糟**：它会让刚被压缩腾空的
+  会话停住。
+- **停摆恢复**（`DEFAULT_STRANDED_RESUME_PROMPT` + hook 2 末尾）：提醒的本质是叫停，唯一会把它接回来
+  的是空闲压缩那一跳；这一跳没成时（读数过期、`compactNow()` 返回 `null`、会话量不出占用）会话就停在
+  半路等人发现。现在在**阈值以下 / 量不出占用**的空闲分支里，若该提醒**确实送达过**而守卫从未答上它，
+  就用一条**条件式**消息重新开轮（「任务没做完就继续，不要重新探索；做完了就一句话说明」）——
+  条件式措辞让「其实已经收尾完成」只花一个廉价回合。恢复的关闭方式：`resumeAfterCompact: false`；
+  goal 拥有这一轮时不插手（goal driver 自己排轮）；`autoCompactOnIdle: false` 时超阈值分支先返回，不恢复。
+
+### 修复
+
+- **`EpisodeState` 的提醒记账分成两个标记**：`warned`（本周期已排队，防重复提醒，随阈值回落复位）与
+  `reminded`（**真的送到了模型**，只在守卫答上它时清：自家 `compactNow()` 成功、停摆恢复已发、或来了一条
+  `source.kind === 'user'` 的人类消息）。此前只有一个 `warned`：阈值回落会把「提醒已送达但没人接」这件事
+  一起抹掉，停摆恢复就无从判断。新增日志 `resume: revived`。
+- **`handleIdle` 先 `await state.evaluation`**：`step/end` 的评估是异步链，空闲那一跳读写的正是它写下的
+  周期标记。不等它就可能读到半路状态（实测：阈值在 `turn/end` 之后被改掉时，晚到的 step-end 评估与
+  空闲判断交错，`reminded` 被先读后写）。`agent/status idle` 与 `turn/end` 的先后由 dsh 决定，插件不能假设。
+- **`agent/pre-step` 折叠监听器不再可能二次执行下游链**：原实现把 `next()` 放在 `try` 里、`catch` 里再调一次
+  `next()`；下游 hook 抛错会被吞掉并**重跑整条瀑布**。现在先接住 `next()` 的结果，本钩子自己的失败降级为
+  那个结果，下游异常照常向外抛。
+
+### 验证
+
+- `npm run verify`（typecheck + vitest + tsdown/esbuild）退出 0、**130 例 / 10 文件**（新增 5 例）。
+- **新用例会拒绝旧行为**（逐条实测）：摘掉投递前复检 → `the wrap-up reminder is re-checked before it is
+  delivered` 挂 3 例；再摘掉停摆恢复 → 同组仍挂 3 例（恢复那例失败）；只摘掉恢复里的 goal 判据 →
+  `leaves a goal-owned session to the goal driver instead of reviving it` 挂 1 例。
+- 4 例分别钉住：①折叠监听器里落的压缩（`StubCompactionEngine.compactOnStepPressure`，模拟
+  `compaction-basic` 在 `agent/pre-step` 上的压力通道）会作废提醒、且**不再叫停会话**；②阈值在折叠时
+  已是另一副读数 → 提醒丢弃，**且同一轮后续步骤仍能重新提醒**（`warned` 确实复位）；③提醒送达后
+  压缩没发生（读数在 `turn/end` 被改）→ 守卫用条件式消息重新开轮，`compactNow` 一次都没调；④goal
+  armed+active 时不恢复、不写 `next-turn`。
+- `tests/resume-prompt.spec.ts` 新增一例钉住新措辞的**反面**：含「不是必须立刻停手」「不适合中断」「越贵」，
+  且**不含**「立即收尾」「接近上限」——旧文本会让该例失败。
+- `tests/stub-compaction.ts` 的压缩事务抽成 `land()`，`compactIfNeeded` 可选落一次真实事务（轮内压缩、
+  无 maintenance 阶段），`compactNow` 的失败路径与 `compactNowCalls` 记账语义不变（`stub-N` 编号改由独立
+  计数器发放，避免两条路径撞号）。
+
+### 文档
+
+- `README.md`：hook 1/2 语义、`resumeAfterCompact` 字段语义、行为语义（新标记记账、投递前复检、停摆恢复）、
+  已知限制（轮内压缩时续跑提示会被丢弃、`compactNow()` 返回 `null` 不重试、收尾措辞与 goal round 的关系）；
+  顺手修掉两处过期表述（注入 source 早已是声明的 `context-guard` kind，不再是 `{ kind: 'plugin' }`）。
+- `AGENTS.md`：闭环第 1/2 条与「关键约定」补 `reminded` 记账、投递前复检、瀑布只取一次 `next()`、
+  `handleIdle` 先 await 评估。
+
+## [0.4.8] - 2026-09-23
+
+### 变更
+
+- **移植到 dsh 0.1.7（Session V4 + settings 重写）**：工具结果在 V4 里是独立的 `role: 'tool'` 消息；
+  本插件的消息源改为**声明的** `context-guard` kind（V4 没有 catch-all `plugin` kind）；`Config` 的 15 个
+  实时字段改 `.volatile()`，删掉 `settings.register` / `scope.watch`（0.1.7 起 settings form 就是所属
+  profile entry 的 Config）。
+- **`@deepseek-ai/schemastery` 依赖 `^3.18.1` → 精确 `3.18.4`**：`.volatile()` 只在 vendor 3.18.4 上存在，
+  profile 锁着旧 3.18.2 时插件 `failed to import`（`volatile is not a function`），线上 `context-guard`
+  整条会**静默失效**。
+- 详细落地记录（peer 列表、测试台与 web/staging 实跑、`settings.yaml` 迁移）见 `../PLUGINS.md` 的 dsh 版本
+  兼容矩阵 0.4.8 单元格。0.4.7 号段未使用。
+
 ## [0.4.6] - 2026-09-17
 
 ### 修复
