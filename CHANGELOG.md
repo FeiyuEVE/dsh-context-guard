@@ -68,6 +68,10 @@ dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peer
 - `AGENTS.md`：闭环第 1/2 条与「关键约定」补 `reminded` 记账、投递前复检、瀑布只取一次 `next()`、
   `handleIdle` 先 await 评估。
 
+
+### 兼容声明（dsh 0.2.1-alpha.1-local.1）
+
+- 7 个 `@deepseek-ai/dsh-*` peer 列表追加 `0.2.1-alpha.1-local.1`；`cordis` peer 改 `^4.0.1 || 4.0.5-alpha.1`；`dependencies.@deepseek-ai/schemastery` `3.18.4 → 3.18.5-alpha.1`（与 0.2.1 vendor 同版）。**源码零改动**；`npm run verify` 130/130。
 ## [0.4.8] - 2026-09-23
 
 ### 变更
