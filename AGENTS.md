@@ -147,6 +147,11 @@ npm run verify      # typecheck && test && build（顺序固定）
   就没人记得。改了这两条任一逻辑，先跑 `tests/context-guard.spec.ts` 的
   `the wrap-up reminder is re-checked before it is delivered` 一组四例（把复检和恢复都摘掉会挂 3 例、
   只摘恢复里的 goal 判据会挂第 4 例）。
+- **守卫注入一律排在其它注入之后**（0.5.2 起）：收尾提醒/续跑提示是「下一步要做什么」，workspace
+  指令、runtime-context 快照、skill catalog 是背景；以 `followup()` 开轮的续跑提示会天然排第一，顺序
+  就是反的。所以 `agent/pre-step` 用 `{ prepend: true }` 注册（瀑布回程 = 所有注入之后），再由
+  `trailOwnNotices()` 把 `kind: 'context-guard'` 的消息移到进入批次末尾。**不要改回普通 `ctx.on`**：
+  激活顺序一变提示就又跑到前面。回归用例：`tests/context-guard.spec.ts` 的 `injection order` 组。
 - **`agent/pre-step` 的瀑布决策只取一次**：折叠监听器先把 `next()` 的结果接住，再决定要不要插提醒 ——
   下游 hook 抛错不能再调一次 `next()`（会二次执行整条链），本钩子自己的失败降级为那个已接住的结果。
 - **`handleIdle` 先 `await state.evaluation`**：`step/end` 的评估是异步的，空闲那一跳读写的正是它写下的

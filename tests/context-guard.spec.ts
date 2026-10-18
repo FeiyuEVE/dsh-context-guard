@@ -102,6 +102,10 @@ type GoalViewLike = {
  *   workspace.
  * @param goals - the live goal view the guard reads through `ctx.get('goals')`;
  *   absent means "this composition mounts no goal service".
+ * @param beforeGuard - runs right before the guard is mounted, so its listeners
+ *   sit upstream of the guard in the waterfall — the position a bundle row
+ *   (agent-instructions, tool-skill) holds in a real profile, where the guard
+ *   is a later user-patch row.
  */
 async function harness(
   script: ScriptEntry[],
@@ -112,6 +116,7 @@ async function harness(
   presets?: (ctx: Context) => { serviceFor(agent: { ctx: Context }, name: string): unknown } | undefined,
   cwd?: string,
   goals?: GoalViewLike,
+  beforeGuard?: (ctx: Context) => void,
 ): Promise<{
   ctx: Context
   agent: Agent
@@ -135,6 +140,7 @@ async function harness(
   }
   const compaction = withCompaction ? new StubCompactionEngine(ctx) : undefined
   await ctx.plugin(AgentLoop, { agents: [] })
+  beforeGuard?.(ctx)
   const fiber = await ctx.plugin(ContextGuard, { ...live, ...config })
   ctx.tools.register(defineContentToolFixture({
     name: 'probe',
@@ -239,6 +245,77 @@ function reserveGoalRoundOnCompaction(ctx: Context, agent: Agent, round = 1): vo
         source: { kind: 'goal', goalId: 'goal-t', revision: 1, round } as never,
       }), 'next-turn', false)
     })
+  })
+}
+
+
+/**
+ * The user-role messages admitted at one step's boundary, in log order.
+ *
+ * The pre-step decision's messages are appended right behind `step/start`, so
+ * slicing to `step/end` captures exactly the batch the injections shaped —
+ * the order the model reads in that request.
+ * @param agent - agent whose session log is read.
+ * @param turn - 1-based turn number.
+ * @param step - 1-based step number within the turn.
+ * @returns the admitted user-message texts; empty when the step never ran.
+ */
+function enteredMessages(agent: Agent, turn: number, step: number): string[] {
+  const events = [...agent.session.snapshotEvents()]
+  const start = events.findIndex(e => e.type === 'step/start' && e.data.turn === turn && e.data.step === step)
+  if (start < 0) return []
+  const texts: string[] = []
+  for (const event of events.slice(start + 1)) {
+    if (event.type === 'step/end') break
+    if (event.type !== 'user/message') continue
+    texts.push(event.data.content.filter(block => block.type === 'text').map(block => block.text).join(''))
+  }
+  return texts
+}
+
+/** The steps under test: the reminder's step and the resumed turn's first. */
+function orderedSteps({ turn, step }: { turn: number; step: number }): boolean {
+  return (turn === 1 && step === 2) || (turn === 2 && step === 1)
+}
+
+/** A user message from a source other than the guard, as another injector's context. */
+function injectedContext(text: string): ReturnType<typeof createUserMessage> {
+  return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'test-fixture' } })
+}
+
+/**
+ * Stand in for `agent-instructions`: splice context behind the claimed batch.
+ *
+ * Mounted BEFORE the guard in the ordering test, i.e. upstream of it in the
+ * waterfall — the position a bundle row holds in a real profile, where the
+ * guard is a later user-patch row.
+ * @param ctx - context to register on.
+ */
+function mountInstructionsInjection(ctx: Context): void {
+  ctx.on('agent/pre-step', async ({ messages, turn, step }, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject' || !orderedSteps({ turn, step })) return decision
+    const lastClaimedIndex = decision.messages.findLastIndex(message => messages.includes(message))
+    return {
+      ...decision,
+      messages: decision.messages.toSpliced(lastClaimedIndex + 1, 0, injectedContext('workspace instructions')),
+    }
+  })
+}
+
+/**
+ * Stand in for the skill catalog: append at the end of the batch.
+ *
+ * Mounted AFTER the guard, i.e. downstream in the waterfall — the position
+ * that used to win a plain registration, so a pass proves the trailing move is
+ * not a registration-order accident.
+ * @param ctx - context to register on.
+ */
+function mountCatalogInjection(ctx: Context): void {
+  ctx.on('agent/pre-step', async ({ turn, step }, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject' || !orderedSteps({ turn, step })) return decision
+    return { ...decision, messages: [...decision.messages, injectedContext('skill catalog')] }
   })
 }
 
@@ -350,6 +427,48 @@ describe('context-guard full loop', () => {
     expect(serviceForCalls).toEqual(['compaction'])
     expect(realm.compaction!.compactNowCalls).toEqual([1])
     expect(compactionEndCount(agent)).toBe(1)
+    void ctx
+  })
+})
+
+describe('injection order', () => {
+  it('trails the continuation and the wrap-up reminder behind every other injection', async () => {
+    // The instructions stand-in is mounted before the guard (upstream), the
+    // catalog stand-in after it (downstream). Both mechanisms are therefore
+    // load-bearing: without `prepend: true` the upstream listener would run
+    // last, and without the trailing move the continuation would stay first.
+    const { ctx, agent, compaction } = await harness(
+      [
+        toolCallResponse('c1', 'probe', { q: 1 }),
+        textResponse('wrapping up now'),
+        textResponse('continuing after compaction'),
+      ],
+      {},
+      300,
+      true,
+      {},
+      undefined,
+      undefined,
+      undefined,
+      mountInstructionsInjection,
+    )
+    // The two steps that carry a guard notice: the tool continuation the
+    // reminder folds into, and the turn the continuation opens.
+    mountCatalogInjection(ctx)
+    await vi.waitFor(() => { expect(turnsEnded(agent)).toBe(2) })
+
+    // Step 2 claimed nothing (tool results enter from the log), so the
+    // instructions open the batch and the reminder has to end it.
+    const reminded = enteredMessages(agent, 1, 2)
+    expect(reminded.slice(0, -1)).toEqual(['workspace instructions', 'skill catalog'])
+    expect(reminded.at(-1)).toContain('不适合中断')
+
+    // The resumed turn opens with the continuation, which used to be read
+    // first — in front of the very context it now follows.
+    const resumed = enteredMessages(agent, 2, 1)
+    expect(resumed.slice(0, -1)).toEqual(['workspace instructions', 'skill catalog'])
+    expect(resumed.at(-1)).toContain('继续')
+    expect(compaction!.compactNowCalls).toEqual([1])
     void ctx
   })
 })

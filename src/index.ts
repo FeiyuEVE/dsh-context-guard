@@ -58,7 +58,11 @@
  * All injected content is user-role context stamped with this plugin's own
  * message source (`{ kind: 'context-guard', form: 'notice' }` — see
  * `notice.ts`), so it is durable in the session log and reconstructable
- * (model-visible ⟺ logged).
+ * (model-visible ⟺ logged). Every notice is trailed to the end of its step's
+ * entering batch: a notice is the material the model must act on, while the
+ * workspace instructions, runtime-context snapshot, and skill catalog are
+ * background — and an opening message would otherwise be read first
+ * (`trailOwnNotices`).
  *
  * @module dsh-context-guard
  */
@@ -81,7 +85,7 @@ import { writeArchive } from './archive.ts'
 import type { Artifacts } from './archive.ts'
 import { DIGEST_FORMAT_VERSION, FRAME_MARKER, digestPathFrom, estimateTextTokens } from './digest.ts'
 import { createLogSink, logInfo, logWarn } from './log.ts'
-import { noticeSource } from './notice.ts'
+import { PLUGIN_SOURCE, noticeSource } from './notice.ts'
 import { archiveLocation, digestPointerCandidates, handoffNotePath } from './paths.ts'
 import {
   DEFAULT_RESUME_PROMPT,
@@ -882,14 +886,93 @@ export function apply(ctx: Context, config: Config): void {
       && pressure.totalTokens < thresholdTokensFor(pressure.provider, pressure.contextWindow)
   }
 
+  /**
+   * Move this plugin's own entering notices to the end of the batch.
+   *
+   * A notice is the material the model must act on — "continue from the
+   * archive", "wrap up now" — while the rest of a first step is background:
+   * workspace instructions, the runtime-context snapshot, the skill catalog.
+   * Claimed as the turn-opening message, the notice sat in front of that
+   * background, so the model read the continuation first and the instructions
+   * last. Trailing it after every other injection follows the catalog's own
+   * rule ("background first, the material to act on last") and leaves the
+   * notice closest to the action it asks for.
+   *
+   * The listener is registered with `prepend: true`, so this runs on the way
+   * back out of the waterfall: every other injector has already extended the
+   * batch and activation order cannot put the notice anywhere but last.
+   *
+   * @param messages - the batch the decision proposes to enter with.
+   * @returns the batch with this plugin's messages last, relative order kept.
+   */
+  function trailOwnNotices(messages: readonly UserMessage[]): UserMessage[] {
+    const own: UserMessage[] = []
+    const background: UserMessage[] = []
+    for (const message of messages) {
+      if (message.source.kind === PLUGIN_SOURCE.kind) own.push(message)
+      else background.push(message)
+    }
+    return own.length === 0 ? [...messages] : [...background, ...own]
+  }
+
+  /**
+   * Fold the pending wrap-up reminder into the entering batch.
+   *
+   * A tool-continuation step may claim nothing (tool results enter the model
+   * history from the log), so the reminder folds into an empty entered batch;
+   * only a genuinely empty FIRST step owns a no-request turn and keeps the
+   * reminder pending. Every branch that declines the fold answers with the
+   * batch unchanged.
+   *
+   * @param agent - agent whose entering batch this step proposes.
+   * @param state - the session's episode state that owns the reminder.
+   * @param decision - the batch the downstream hooks decided on.
+   * @param reminder - the reminder captured before `next()` ran.
+   * @param step - the proposed step number.
+   * @param claimed - the messages the inbox claimed for this step.
+   * @returns the batch to enter with, reminder included when it still holds.
+   */
+  async function foldReminder(
+    agent: Agent,
+    state: EpisodeState,
+    decision: Extract<PreStepDecision, { kind: 'enter' }>,
+    reminder: UserMessage,
+    step: number,
+    claimed: readonly UserMessage[],
+  ): Promise<UserMessage[]> {
+    try {
+      if (step === 1 && decision.messages.length === 0) return decision.messages
+      // A compaction that landed while the downstream hooks ran (the preset's
+      // own pressure pass is one of them) already owns the relief, and the
+      // compaction/end hook voids the reminder for exactly that reason — so a
+      // reminder it dropped must not be folded from this stale local copy.
+      if (state.pendingReminder !== reminder) return decision.messages
+      // Nothing voided it, but the pressure it was queued on may still have gone:
+      // a reading that no longer holds must not stop the session.
+      if (await reminderOutlived(agent)) {
+        state.pendingReminder = undefined
+        state.warned = false
+        logInfo(log, '', 'wrap-up-dropped', { agent: agent.id, reason: 'below-threshold' })
+        return decision.messages
+      }
+      state.pendingReminder = undefined
+      state.reminded = true
+      const lastClaimedIndex = decision.messages.findLastIndex(message => claimed.includes(message))
+      return decision.messages.toSpliced(lastClaimedIndex + 1, 0, reminder)
+    } catch (error: unknown) {
+      logWarn(log, '', 'pre-step-fold-failed', { agent: agent.id, error: String(error) })
+      return decision.messages
+    }
+  }
+
   // Fold a pending wrap-up reminder into the entering messages after the
   // claimed batch, so it reaches the very next request deterministically
-  // (agent.inject() from an async step-end listener would miss the claim).
-  // A tool-continuation step may claim nothing (tool results enter the model
-  // history from the log), so the reminder folds into an empty entered batch;
-  // only a genuinely empty FIRST step owns a no-request turn and keeps the
-  // reminder pending. Any guard failure here degrades to the unmodified
-  // decision, so the loop is never disturbed.
+  // (`agent.inject()` from an async step-end listener would miss the claim),
+  // then trail this plugin's notices behind every other injection of the step.
+  // Any guard failure here degrades to the unmodified decision, so the loop is
+  // never disturbed. `prepend: true` is what makes the trailing move run after
+  // every other injector instead of wherever activation order placed this row;
+  // the time context registers the same way for the same reason.
   ctx.on('agent/pre-step', async ({ agent, messages, step }, next): Promise<PreStepDecision> => {
     const state = stateOf(agent.session)
     await state.evaluation
@@ -898,32 +981,12 @@ export function apply(ctx: Context, config: Config): void {
     // own logic: a failure below must degrade to what the downstream hooks
     // decided, and must not run them a second time.
     const decision = await next()
-    if (reminder === undefined) return decision
-    try {
-      if (decision.kind === 'reject' || (step === 1 && decision.messages.length === 0)) return decision
-      // A compaction that landed while the downstream hooks ran (the preset's
-      // own pressure pass is one of them) already owns the relief, and the
-      // compaction/end hook voids the reminder for exactly that reason — so a
-      // reminder it dropped must not be folded from this stale local copy.
-      if (state.pendingReminder !== reminder) return decision
-      // Nothing voided it, but the pressure it was queued on may still have gone:
-      // a reading that no longer holds must not stop the session.
-      if (await reminderOutlived(agent)) {
-        state.pendingReminder = undefined
-        state.warned = false
-        logInfo(log, '', 'wrap-up-dropped', { agent: agent.id, reason: 'below-threshold' })
-        return decision
-      }
-      state.pendingReminder = undefined
-      state.reminded = true
-      const lastClaimedIndex = decision.messages.findLastIndex(message => messages.includes(message))
-      const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, reminder)
-      return { ...decision, messages: entered }
-    } catch (error: unknown) {
-      logWarn(log, '', 'pre-step-fold-failed', { agent: agent.id, error: String(error) })
-      return decision
-    }
-  })
+    if (decision.kind === 'reject') return decision
+    const entered = reminder === undefined
+      ? decision.messages
+      : await foldReminder(agent, state, decision, reminder, step, messages)
+    return { ...decision, messages: trailOwnNotices(entered) }
+  }, { prepend: true })
 
   const compactionController = new AbortController()
   ctx.effect(() => () => { compactionController.abort() })

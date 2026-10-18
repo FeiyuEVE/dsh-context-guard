@@ -4,6 +4,23 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.5.2] - 2026-10-19
+
+### 修复
+
+- **守卫注入排在其它注入之后**：收尾提醒与续跑提示此前是进入批次的第一条（续跑提示以 `followup()`
+  开轮，循环 `claim()` 时天然排第一），模型于是先读「继续任务」、后读 workspace 指令 /
+  runtime-context / skill catalog。现在 `agent/pre-step` 以 `{ prepend: true }` 注册（瀑布回程 =
+  所有注入之后），再由 `trailOwnNotices()` 把 `kind: 'context-guard'` 的消息移到批次末尾；
+  与插件激活顺序无关。
+
+### 验证
+
+- `npm run verify`（typecheck + vitest + tsdown/esbuild）退出 0、**131 例 / 10 文件**（新增 1 例）。
+- 新用例 `injection order` 在守卫**上下游各挂一个注入监听器**（上游照 `agent-instructions` 在
+  claimed batch 后 splice，下游照 `tool-skill` 在末尾 append），断言收尾提醒与续跑提示都排在最后；
+  摘掉 `prepend: true` 或摘掉 trailing 各挂 1 例，确认两条机制分别必要。
+
 ## [0.5.0] - 2026-09-26
 
 ### 变更

@@ -254,6 +254,23 @@
   监听器（注册在守卫之后 = 瀑布下游）触发 —— 守卫的折叠在 `await next()` 的**回程**上跑，所以时序是
   确定的，不需要 sleep。
 
+## 注入顺序：开轮消息天然在最前（0.5.2）
+
+- **症状**：一轮的「上下文注入」在会话里读作 `context-guard → AGENTS.md → runtime-context →
+  skill-catalog` —— 模型先读「上下文已压缩，已恢复任务」，再读规则与目录，等于把「要它做的下一步」
+  放在背景之前。根因不是插件激活顺序，而是**续跑提示本身是开轮消息**：`agent.followup()` 走
+  `next-turn`，循环 `claim()` 时它就是进入批次的第一条；其余注入都是后续 `agent/pre-step`
+  监听器往这个批次里加/插的，天然排在它后面。
+- **修法**：`agent/pre-step` 监听器用 `{ prepend: true }` 注册 —— 瀑布在**回程**上（`await next()`
+  之后）执行它，此时 `agent-instructions` 的 splice、system-prompt 的 runtime-context、tool-skill 的
+  catalog 都已加完；再用 `trailOwnNotices()` 把 `kind: 'context-guard'` 的消息整体移到末尾。
+  不要指望「注册得晚 = 跑得晚」：普通 `ctx.on` 的顺序跟着插件激活走（用户 patch 里的行通常排在
+  bundle 行之后 = 瀑布**最内层**），换一次组合就可能变；`time-context` 用同一手法保证自己的快照在最后。
+- **回归用例**：`tests/context-guard.spec.ts` 的 `injection order` 组。上游监听器（照
+  `agent-instructions` 在 claimed batch 后 splice，经 `harness(..., beforeGuard)` 挂在守卫**之前**）
+  与下游监听器（照 tool-skill 在末尾 append，挂在守卫之后）各一个；两条机制分别摘掉都挂：
+  摘 `prepend: true` → 上游 listener 跑到最后（`skill catalog` 变成首条）；摘 trail → 续跑提示留在首位。
+
 ## 日志
 
 - **字段不含正文**：只有路径、计数、名称；`context-guard: knobs source=settings|config|default` 是排查

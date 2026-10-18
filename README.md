@@ -298,6 +298,11 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
   （`agent.inject()` 会错过领取），因此提醒通过 `agent/pre-step` waterfall 折叠进进入消息，保证下一次
   请求必达；工具结果不经过 inbox（由日志派生模型历史），工具延续步骤的进入批次可能为空，此时提醒
   单独作为该步骤的进入消息。
+- **注入位置：守卫的话排在背景之后**（0.5.2 起）：收尾提醒与续跑提示都落在**该步骤其它注入的后面** ——
+  workspace 指令、runtime-context 快照、skill catalog 是背景，守卫的话是「下一步做什么」。续跑提示以
+  `followup()` 开轮时天然是进入批次的第一条，模型于是先读「继续任务」、后读规则，顺序是反的。
+  `agent/pre-step` 因此以 `{ prepend: true }` 注册，在瀑布回程上由 `trailOwnNotices()` 把
+  `kind: 'context-guard'` 的消息移到批次末尾；与插件激活顺序无关。
 - **收尾提醒投递前复检**（0.5.0 起）：提醒在 `step/end` 排队、到下一个 `agent/pre-step` 才折叠进上下文，
   中间可能已经发生压缩（preset 自己的 `compaction-basic` 压力通道就在同一个 `agent/pre-step` 上），
   读数也可能已经回落。折叠前因此再看两件事：这条提醒是否已被 `compaction/end` 作废（拿的是同一个对象
