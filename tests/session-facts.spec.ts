@@ -9,6 +9,7 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import {
   availableToolNames,
   checkpointText,
+  delegableToolNames,
   compactionPace,
   lastHumanIntent,
   pendingTodos,
@@ -22,12 +23,13 @@ interface FakeEvent {
 }
 
 /** A session-shaped double exposing only what the readers are allowed to use. */
-function fakeSession(events: FakeEvent[], tools?: string[]): Session {
+function fakeSession(events: FakeEvent[], tools?: string[], delegationDepth?: number): Session {
   return {
     snapshotEvents: () => events,
     requestHeader: () => tools === undefined
       ? undefined
       : { tools: tools.map(name => ({ name, description: '', parameters: {} })) },
+    header: delegationDepth === undefined ? undefined : { delegationDepth },
   } as unknown as Session
 }
 
@@ -112,6 +114,18 @@ describe('availableToolNames', () => {
   it('reads the entering request header, empty when there is none', () => {
     expect(availableToolNames(fakeSession([], ['subagent', 'read']))).toEqual(['subagent', 'read'])
     expect(availableToolNames(fakeSession([]))).toEqual([])
+  })
+})
+
+describe('delegableToolNames', () => {
+  it('keeps the header list for a top-level session', () => {
+    expect(delegableToolNames(fakeSession([], ['subagent', 'read']))).toEqual(['subagent', 'read'])
+  })
+
+  it('refuses a subagent child whose depth is already spent', () => {
+    // The header still lists what the child inherited; the depth is what makes
+    // a call throw, and it is the one fact the header carries.
+    expect(delegableToolNames(fakeSession([], ['subagent', 'workflow'], 1))).toEqual([])
   })
 })
 

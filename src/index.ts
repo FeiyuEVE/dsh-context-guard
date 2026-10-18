@@ -95,9 +95,9 @@ import {
   decideResume,
 } from './resume-prompt.ts'
 import {
-  availableToolNames,
   checkpointText,
   compactionPace,
+  delegableToolNames,
   lastHumanIntent,
   pendingTodos,
 } from './session-facts.ts'
@@ -808,7 +808,9 @@ export function apply(ctx: Context, config: Config): void {
       )
       const rawPath = await existingFile(recorded?.rawPath ?? (ownsFrame ? rawPathFrom(frame) : undefined))
       const pace = compactionPace(agent.session, Date.now(), resolved.resumeWindowMinutes)
-      const delegation = availableToolNames(agent.session)
+      // A subagent child cannot delegate: its depth is already spent, even
+      // though the header still lists the tools it inherited.
+      const delegation = delegableToolNames(agent.session)
         .filter(tool => delegationTools.includes(tool))
       const decision = decideResume(template, {
         compactionsInWindow: pace.autoInWindow,

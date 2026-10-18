@@ -74,6 +74,25 @@ export function availableToolNames(session: Session): string[] {
   return tools.map(tool => tool.name)
 }
 
+/**
+ * Tools a delegation from this session could actually reach.
+ *
+ * The request header lists the delegation tools a child inherits from its
+ * parent's composition, but the child's depth is already spent: `maxDepth`
+ * defaults to 1, so a call from a depth-1 session throws. The guard cannot read
+ * the tool's own depth setting, so it stays conservative and treats any
+ * non-zero `delegationDepth` as unable to delegate. A composition that raises
+ * the cap only loses the suggestion inside children, which is harmless; the
+ * reverse would hand a child an instruction it cannot carry out.
+ *
+ * @param session - session whose next request carries the tools.
+ * @returns the names, or an empty list for a session that cannot delegate.
+ */
+export function delegableToolNames(session: Session): string[] {
+  if ((session.header?.delegationDepth ?? 0) > 0) return []
+  return availableToolNames(session)
+}
+
 /** One `todo/write` payload entry, read structurally. */
 interface TodoItemLike {
   content?: unknown

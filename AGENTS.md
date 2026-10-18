@@ -152,10 +152,14 @@ npm run verify      # typecheck && test && build（顺序固定）
   就是反的。所以 `agent/pre-step` 用 `{ prepend: true }` 注册（瀑布回程 = 所有注入之后），再由
   `trailOwnNotices()` 把 `kind: 'context-guard'` 的消息移到进入批次末尾。**不要改回普通 `ctx.on`**：
   激活顺序一变提示就又跑到前面。回归用例：`tests/context-guard.spec.ts` 的 `injection order` 组。
-- **续跑提示里带一条「分工」条款**（0.5.3 起）：主线规划/验收/汇报，具体执行优先派请求头里实际存在的
-  委派工具。`delegationTools` 为空时**整段不出现**（子 agent 不能再派孙 agent，给它这条等于给一条执行
-  不了的指令）。条款由 `divisionOfLabour()` 追加、不写进模板，用户的自定义模板也带得上；L2 的「先拆分」
-  引用它（`按上面的分工…`），不要再单独列一遍工具。回归用例：`tests/resume-prompt.spec.ts` 的三例。
+- **续跑提示里带一条「分工」条款**（0.5.3 起，0.5.4 补齐子 agent 判据）：主线规划/验收/汇报，具体执行
+  优先派请求头里实际存在的委派工具。条款由 `divisionOfLabour()` 追加、不写进模板，用户的自定义模板也
+  带得上；L2 的「先拆分」引用它（`按上面的分工…`），不要再单独列一遍工具。
+  **判据是 `delegableToolNames()` 而不是 `availableToolNames()`**：子 agent 的请求头照样列着它继承来的
+  `subagent` / `workflow`（实测 depth=1 的子会话仍带这三个），但 `delegationDepth > 0` 时 `maxDepth`
+  （默认 1）已经用完，调用只会抛 `SubagentDepthError` —— 所以深度非零时整段不出现。回归用例：
+  `tests/resume-prompt.spec.ts` 三例（空列表不出条款）+ `tests/session-facts.spec.ts` 的
+  `delegableToolNames` 两例。
 - **`agent/pre-step` 的瀑布决策只取一次**：折叠监听器先把 `next()` 的结果接住，再决定要不要插提醒 ——
   下游 hook 抛错不能再调一次 `next()`（会二次执行整条链），本钩子自己的失败降级为那个已接住的结果。
 - **`handleIdle` 先 `await state.evaluation`**：`step/end` 的评估是异步的，空闲那一跳读写的正是它写下的

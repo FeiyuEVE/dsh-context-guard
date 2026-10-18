@@ -4,6 +4,19 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.5.4] - 2026-10-19
+
+### 修复
+
+- **子 agent 会话不再收到「派子 agent」的分工条款**：0.5.3 按请求头判断可委派性，但子会话的请求头
+  照样列着从父组合继承来的 `subagent` / `subagent_fork` / `workflow`（实测 `delegationDepth: 1` 的子
+  会话三个都在），而 `maxDepth` 默认 1，从深度 1 再派只会抛 `SubagentDepthError`。判据改为
+  `delegableToolNames()`：`delegationDepth > 0` 直接返回空列表，条款整段不出现；L2 的委派建议同样受益。
+
+### 验证
+
+- `npm run verify` 退出 0、**136 例 / 10 文件**（新增 `delegableToolNames` 两例：顶层保留、深度非零清空）。
+
 ## [0.5.3] - 2026-10-19
 
 ### 变更

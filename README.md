@@ -122,8 +122,9 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
   的自动压缩，手动 `/compact` 不计入）。
 - **分工条款每个级别都带**（L3 抑制的告示除外）：主线（模型自己）负责规划、验收与汇报，具体执行优先派
   请求头里**确实存在**的委派工具（检索、长文阅读、漫游式探索、单点实现都交出去，能并行的同时派；
-  子 agent 看不到本会话，派活要写全目标与验收标准，回来先核证据）。会话不能委派时（例如它本身就是
-  个子 agent，`subagent` 默认不能再派孙 agent）整段不出现 —— 不会给一条执行不了的指令。
+  子 agent 看不到本会话，派活要写全目标与验收标准，回来先核证据）。会话不能委派时整段不出现 ——
+  按 `delegationDepth` 判断：子会话的请求头仍列着继承来的 `subagent` / `workflow`，但深度已经用完
+  （`maxDepth` 默认 1），给它的只会是一条抛 `SubagentDepthError` 的指令。
 - L2 的「先拆分再继续」建立在上面那段之上（`按上面的分工…`），不重复列举工具。
 - 委派工具只有在 `requestHeader().tools` 里**确实存在**时才会被点名，不会建议一个不存在的工具。
 - L3 抑制**与 `resumeEscalation` 开关无关**，始终生效 —— 它是防「压缩—续跑空转」烧 token 的安全阀。

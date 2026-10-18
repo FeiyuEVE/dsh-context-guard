@@ -223,10 +223,11 @@ function todoBlock(todos: readonly string[]): string {
  *
  * Appended to every continuation rather than baked into the template, so a
  * hand-written template cannot silently drop the working style that keeps a
- * compacted session from filling up again. Rendered only when the request
- * header really carries one of the configured delegation tools: a subagent
- * session has none (subagents cannot spawn descendants under the default depth),
- * and telling it to delegate would be an instruction it cannot follow.
+ * compacted session from filling up again. Rendered only when the caller's
+ * `delegationTools` is non-empty: the guard passes an empty list for a session
+ * that cannot delegate (a subagent child still lists the tools it inherited,
+ * but its depth is already spent), so the clause never becomes an instruction
+ * the model cannot carry out.
  *
  * @param facts - measured facts; `delegationTools` are names present in the header.
  * @returns the clause, or an empty string when this session cannot delegate.
