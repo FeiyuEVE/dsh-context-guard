@@ -63,6 +63,37 @@ describe('decideResume', () => {
     expect(withoutTool.prompt).toContain('按需片段')
   })
 
+  it('carries the division of labour on a continuation that can delegate', () => {
+    const decision = decideResume(DEFAULT_RESUME_PROMPT, facts({
+      delegationTools: ['subagent', 'subagent_fork'],
+    }), { escalation: true })
+    expect(decision.level).toBe('L0')
+    expect(decision.prompt).toContain('分工：主线（你）负责规划、验收与汇报')
+    expect(decision.prompt).toContain('`subagent` / `subagent_fork`')
+    expect(decision.prompt).toContain('回来先核证据')
+  })
+
+  it('omits the division clause for a session that cannot delegate, and for a suppressed resume', () => {
+    const withoutTools = decideResume(DEFAULT_RESUME_PROMPT, facts(), { escalation: true })
+    expect(withoutTools.prompt).not.toContain('分工：主线')
+
+    const suppressed = decideResume(DEFAULT_RESUME_PROMPT, facts({
+      compactionsInWindow: 5,
+      delegationTools: ['subagent'],
+    }), { escalation: true })
+    expect(suppressed.suppress).toBe(true)
+    expect(suppressed.prompt).not.toContain('分工：主线')
+  })
+
+  it('renders the division clause exactly once at L2, where the split advice builds on it', () => {
+    const decision = decideResume(DEFAULT_RESUME_PROMPT, facts({
+      compactionsInWindow: 3,
+      delegationTools: ['subagent'],
+    }), { escalation: true })
+    expect(decision.prompt.match(/分工：主线/g)).toHaveLength(1)
+    expect(decision.prompt).toContain('按上面的分工')
+  })
+
   it('suppresses resume at the window cap, regardless of the escalation switch', () => {
     for (const escalation of [true, false]) {
       const decision = decideResume(DEFAULT_RESUME_PROMPT, facts({ compactionsInWindow: 5 }), { escalation })

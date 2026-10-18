@@ -6,8 +6,13 @@
  * useless — the agent already kept going, and the working style, not the
  * instruction, is what has to change. The builders below therefore render one
  * *fact-anchored* prompt whose escalation level follows measured compaction
- * frequency, and which mentions delegation only when the session's own request
- * header actually carries a delegation tool.
+ * frequency.
+ *
+ * Two clauses are appended by the guard rather than left to the template,
+ * because they hold for every continuation regardless of the user's wording:
+ * the division of labour (the main line plans and checks, execution goes to a
+ * delegated agent — rendered only when the session's request header actually
+ * carries such a tool) and, at L2, the split-first instruction.
  *
  * Everything here is a pure function of its inputs, so level selection and
  * template rendering are golden-testable without a running loop.
@@ -212,6 +217,28 @@ function todoBlock(todos: readonly string[]): string {
   return `\n未完成待办：\n${todos.slice(0, 8).map(item => `- ${item}`).join('\n')}`
 }
 
+/**
+ * The division-of-labour clause: the main line plans and checks, execution goes
+ * to a delegated agent.
+ *
+ * Appended to every continuation rather than baked into the template, so a
+ * hand-written template cannot silently drop the working style that keeps a
+ * compacted session from filling up again. Rendered only when the request
+ * header really carries one of the configured delegation tools: a subagent
+ * session has none (subagents cannot spawn descendants under the default depth),
+ * and telling it to delegate would be an instruction it cannot follow.
+ *
+ * @param facts - measured facts; `delegationTools` are names present in the header.
+ * @returns the clause, or an empty string when this session cannot delegate.
+ */
+function divisionOfLabour(facts: ResumeFacts): string {
+  if (facts.delegationTools.length === 0) return ''
+  return '\n分工：主线（你）负责规划、验收与汇报，具体执行优先派 '
+    + toolList(facts.delegationTools)
+    + ' —— 检索、长文阅读、漫游式探索、单点实现都交出去，能并行的同时派；'
+    + '子 agent 看不到本会话，派活时写全目标与验收标准，回来先核证据再采纳。'
+}
+
 /** The level-specific instruction appended after the base template. */
 function levelBlock(level: ResumeLevel, facts: ResumeFacts): string {
   const window = String(facts.windowMinutes)
@@ -223,8 +250,8 @@ function levelBlock(level: ResumeLevel, facts: ResumeFacts): string {
   if (level === 'L2') {
     const head = `\n本会话已连续压缩 ${count} 次，说明单上下文放不下这项工作。请先拆分再继续：\n`
     const delegation = facts.delegationTools.length > 0
-      ? `1) 检索、批量阅读、漫游式探索交给 ${toolList(facts.delegationTools)}（只把结论带回主线）；\n`
-        + '2) 主线只保留决策与编辑；\n'
+      ? '1) 按上面的分工把执行派出去，主线只保留决策与验收；\n'
+        + '2) 每块都要有明确的验收标准，能并行的同时派；\n'
       : '1) 大文件阅读切成按需片段（用 read 精确取片，而不是整文件通读）；\n'
         + '2) 已确认的结论写进 todo_write，不要留在上下文里；\n'
     return head + delegation
@@ -272,7 +299,7 @@ export function decideResume(template: string, facts: ResumeFacts, policy: Resum
   return {
     level,
     suppress: false,
-    prompt: `${base.trimEnd()}${levelBlock(level, facts)}${todoBlock(facts.todos)}`,
+    prompt: `${base.trimEnd()}${divisionOfLabour(facts)}${levelBlock(level, facts)}${todoBlock(facts.todos)}`,
   }
 }
 
