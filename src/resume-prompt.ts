@@ -22,7 +22,7 @@
 
 /**
  * Default wrap-up reminder: finish what cannot be interrupted, externalize
- * state, hand off, then stop.
+ * state onto the ticket platform, hand off, then stop.
  *
  * The wording is deliberately *soft* and states the real reason (a long context
  * costs more per request) instead of a hard limit it did not measure: the guard
@@ -31,16 +31,18 @@
  * "continue" is what makes a model abandon half a round; "finish the
  * uninterruptible part, do not start anything new, then hand off" composes with
  * either instruction and still delivers the cost signal.
+ *
+ * State is externalized onto the ticket platform, not into a note file: tickets
+ * are the one carrier that survives compaction and session boundaries. The
+ * `{{notePath}}` placeholder still exists for hand-written templates, but the
+ * built-in text no longer asks for a `.handoff` document.
  */
 export const DEFAULT_WRAP_UP_PROMPT =
   '当前上下文已经很长了 —— 这不是因为碰到了上限，而是因为上下文越长，后续每次请求越贵。\n'
-  + '所以请收尾，但不是必须立刻停手：先把**不适合中断**的事情做完（正在进行的编辑、'
-  + '已经发出还没拿到结果的命令、当次工具调用的收尾），不要再展开新的探索或大范围重读。然后：\n'
-  + '1) 若任务尚未完成，把关键状态写入 `{{notePath}}`；该文件**第一行标题**必须是 '
-  + '`# 第 {{epoch}} 次压缩 · 接力笔记 · <一句话主题>`（本会话第 {{epoch}} 次压缩），'
-  + '正文写涉及的文件路径、已做决策、未完成项、下一步，并在下面的接力总结中给出该路径；\n'
-  + '2) 用 todo_write 把未完成项写成待办清单（它会被自动摘要带进下一段上下文）；\n'
-  + '3) 在回复末尾输出一段 ≤200 字、自包含的接力总结（截断后它将是上下文里唯一的对话帧）；\n'
+  + '所以请收尾，但不是必须立刻停手：先把**不适合中断**的事情做完（正在进行的编辑、已经发出还没拿到结果的命令、当次工具调用的收尾），不要再展开新的探索或大范围重读。然后：\n'
+  + '1) 把当前正在负责的工单同步到待办平台（本会话挂了 `task_platform` MCP 时用 `change_ticket_status` 推阶段、`add_comment` 记结论与证据；没挂就写清工单号与状态）：**新出现的待办必须先 `create_ticket` 建单**，不许只留在对话里；连一张工单都没接的临时活，也先建单再继续；\n'
+  + '2) 用 todo_write 写一份短清单（只作本段上下文被摘要后的临时补充，权威状态在单据上）；\n'
+  + '3) 在回复末尾输出一段 ≤200 字、自包含的接力总结：结论 + 工单号 + 下一步（截断后它是上下文里唯一的对话帧）；\n'
   + '4) 收尾完成后停下即可。'
 
 /**
@@ -68,20 +70,20 @@ export const DEFAULT_STRANDED_RESUME_PROMPT =
   + '如果已经收尾完成，用一句话说明结论即可。'
 
 /**
- * Default continuation prompt: pick the task back up from the digested state.
+ * Default continuation prompt: confirm progress from the tickets, then keep
+ * working the open one.
  *
- * `{{archive}}` renders the handoff-document clause — written to state plainly
- * that the document exists and where it is, and to say so only when it really
- * does (see {@link archiveClause}). It never asks the agent to verify the file:
- * the guard checked the filesystem before rendering, and an existence check by
- * the model would be a wasted step. `{{digest}}`/`{{raw}}` stay available for
- * hand-written templates.
+ * Tickets are the authoritative carrier of in-flight state across a compaction;
+ * the conversation frame that gets truncated is exactly where that state used
+ * to live. The resume therefore starts by reading the tickets back, not by
+ * re-reading an archive document. `{{archive}}` (the handoff-document clause,
+ * see {@link archiveClause}) and `{{digest}}`/`{{raw}}` stay available for
+ * hand-written templates that still want to point at the archive.
  */
 export const DEFAULT_RESUME_PROMPT =
   '上下文已压缩。\n'
-  + '{{archive}}\n'
-  + '然后继续执行压缩前正在进行的任务，直到任务完成；'
-  + '需要更多细节时再按需 read，不必在上下文中复述整份归档。'
+  + '先看单据，不要凭对话记忆：用 `task_platform` 的 `list_tickets` / `get_ticket` 拉出当前负责的工单（需要结论与证据细节时用 `list_comments`），确认每张单的阶段与最近一条记录；以工单状态为准确认进度，然后继续执行未完成的工单，直到该工单被推进到应到的状态。\n'
+  + '本段没有单据信息时，先用 todo_write 里的清单兜底，并立即把缺的工单补建到待办平台。'
 
 /** Escalation level of one resume decision. */
 export type ResumeLevel = 'L0' | 'L1' | 'L2' | 'L3'
@@ -116,8 +118,6 @@ export interface ResumeFacts {
   todos: string[]
   /** Last direct human request, clipped. */
   intent?: string | undefined
-  /** This session's archive directory, so an L2 stop-note lands there too. */
-  noteDir?: string | undefined
   /** Delegation-capable tool names present in the session's request header. */
   delegationTools: string[]
 }
@@ -128,7 +128,10 @@ export interface WrapUpFacts {
   todos: string[]
   /** Number the coming compaction will carry for this session (1-based). */
   epoch: number
-  /** Absolute path the note must be written to (session directory). */
+  /**
+   * Absolute note path exposed as `{{notePath}}` for hand-written templates
+   * (session directory). The built-in text no longer writes such a note.
+   */
   notePath: string
 }
 
@@ -256,8 +259,8 @@ function levelBlock(level: ResumeLevel, facts: ResumeFacts): string {
       : '1) 大文件阅读切成按需片段（用 read 精确取片，而不是整文件通读）；\n'
         + '2) 已确认的结论写进 todo_write，不要留在上下文里；\n'
     return head + delegation
-      + `3) 若仍无法收敛，把当前状态写入 \`${facts.noteDir ?? '.handoff/'}\` 下的一个 md 文件，`
-      + '停下并向用户报告。'
+      + '3) 若仍无法收敛，把当前状态落到待办平台的对应工单（`add_comment` 记结论与证据、'
+      + '`change_ticket_status` 推阶段），再停下向用户报告。'
   }
   return ''
 }

@@ -18,6 +18,7 @@ overrides:
   '@deepseek-ai/dsh-settings': 'link:../deepseek-harness/packages/settings/settings'
   '@deepseek-ai/dsh-session-projection': 'link:../deepseek-harness/packages/session/session-projection'
   '@deepseek-ai/dsh-tools': 'link:../deepseek-harness/packages/core/tools'
+  '@deepseek-ai/dsh-tool-testkit': 'link:../deepseek-harness/packages/test-support/tool-testkit'
 
 allowBuilds:
   esbuild: true

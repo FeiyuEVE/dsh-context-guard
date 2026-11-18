@@ -4,6 +4,52 @@
 
 dsh 处于预发布阶段：本插件每个版本都在 `package.json` 的 `peerDependencies` 里**显式列出**兼容的 `@deepseek-ai/dsh-*` 版本（禁止 `*` / 过宽范围），dsh 升级后按工作区「dsh 升级联动」规则追加新版本号并发补丁版。
 
+## [0.6.0] - 2026-11-19
+
+### 变更
+
+- **收尾不再写接力笔记，交接载体改为待办平台的工单**：内置 `DEFAULT_WRAP_UP_PROMPT` 不再要求把状态
+  写进 `{{notePath}}`（`.handoff` 笔记），改为要求把当前负责的工单同步到 `task_platform`
+  （`change_ticket_status` 推阶段、`add_comment` 记结论与证据；没挂 MCP 就写清工单号与状态）：
+  **新出现的待办必须先 `create_ticket` 建单**，不许只留在对话里；连一张工单都没接的临时活也先建单。
+  之后才写 todo_write、给 ≤200 字接力总结并停下。
+- **续跑先看单据，不再先读归档**：内置 `DEFAULT_RESUME_PROMPT` 去掉 `{{archive}}`，改为用
+  `task_platform` 的 `list_tickets` / `get_ticket`（必要时 `list_comments`）拉出当前负责的工单，
+  以工单状态为准确认进度并继续执行；本段没有单据信息时才用 todo_write 兜底并立即补建工单。
+- **L2 的「收敛不了」出口指向工单**：从「把状态写进 `.handoff/` 下的 md 文件」改为落到待办平台的
+  对应工单（评论 + 阶段），再停下向用户报告。
+- **占位符机制完整保留**：`{{archive}}`（交接文档声明块）与 `{{notePath}}`（会话目录下的
+  `epoch-N.handoff.md`）仍可被自定义模板使用，`{{digest}}`/`{{raw}}`/`{{epoch}}` 等照旧；只是两段
+  内置模板不再引用它们。L3 抑制告示仍附归档位置。归档本身（digest / raw / 旁挂 / 接管）不变。
+
+### 维护
+
+- **跟上 dsh 0.2.2 的测试夹具迁移**：`defineContentToolFixture` 已从 `@deepseek-ai/dsh-tools` 移到
+  `@deepseek-ai/dsh-tool-testkit`，两个行为 spec 改导入该包，并在 `pnpm-workspace.yaml` 增加 link
+  override、`package.json` 增加对应 devDependency。
+- **实时字段用例改读 `fiber.effectiveConfig`**：cordis 4.0.5 起 `fiber.config` 保存的是组合传入的原始
+  输入，解析后（带 `Volatile` 引用）的配置在 `effectiveConfig`；旧写法让 live 阈值用例拿到 `undefined`
+  并连带 4 例失败。
+- 0.5.5 的版本声明随本提交入库：7 个 `@deepseek-ai/dsh-*` peer 依赖追加
+  `0.2.2-rc.1` / `0.2.2-rc.1-local.1`（该版 2026-11-07 已发私源，当时未入 git，见下）。
+
+### 验证
+
+- `npm run verify` 退出 0、**141 例 / 10 文件**，无 skipped。
+- 新增/更新回归：两段默认模板逐字 golden；默认 wrap-up 不含 `notePath`/`.handoff`；默认 resume 不含
+  `{{archive}}` 且含 `task_platform`；L2 块不含 `.handoff`；自定义模板仍替换
+  `{{archive}}`/`{{notePath}}`/`{{epoch}}`。归档指针组改为显式使用 `{{archive}}` 模板，断言强度不变
+  （仍逐条验证「只认真实存在的路径」与「无归档时如实说明」）。
+
+## [0.5.5] - 2026-11-07
+
+### 维护
+
+- **跟上 dsh 0.2.2**：7 个 `@deepseek-ai/dsh-*` peer 依赖追加 `0.2.2-rc.1` /
+  `0.2.2-rc.1-local.1`。
+- 说明：该版当时只发布了私源、没有入库（`package.json` 的改动留在工作区）；版本声明随 0.6.0 的
+  提交一并入库，因此本文件补记在此。
+
 ## [0.5.4] - 2026-10-19
 
 ### 修复

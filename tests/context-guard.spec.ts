@@ -20,7 +20,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
-import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import { defineContentToolFixture } from '@deepseek-ai/dsh-tool-testkit'
 import * as ContextGuard from '../src/index.ts'
 import type { ConfigInput } from '../src/index.ts'
 import { FRAME_MARKER } from '../src/digest.ts'
@@ -41,6 +41,16 @@ declare module '@deepseek-ai/dsh-llm' {
 
 /** Long initial task text: ~440 heuristic tokens, over a 255-token threshold. */
 const TASK_TEXT = 'start '.repeat(350)
+
+/**
+ * A continuation template that asks for the archive clause.
+ *
+ * The built-in template no longer names the digest/raw documents (tickets are
+ * the hand-off carrier since 0.6.0), so the archive-pointer suites opt back in
+ * explicitly. That keeps what they prove — which files the guard may name —
+ * while the default's own wording is pinned in `resume-prompt.spec.ts`.
+ */
+const ARCHIVE_RESUME_TEMPLATE = '{{archive}}\n继续执行未完成的任务。'
 
 /**
  * The one write the Loader performs when an edit changes only live fields.
@@ -67,7 +77,11 @@ function commitLive(ref: unknown, value: unknown): void {
 
 /** The live reference behind one field of a running fiber's resolved Config. */
 function liveField(fiber: Fiber, field: string): unknown {
-  return Reflect.get(fiber.config as object, field)
+  // `fiber.config` is the raw input a composition passed; the resolved config —
+  // the one that carries the `Volatile` references the plugin reads — is
+  // `effectiveConfig` (cordis 4.0.5+). Reading `config` here silently yielded
+  // `undefined` for every live field, so the commit had nothing to write into.
+  return Reflect.get(fiber.effectiveConfig as object, field)
 }
 
 /**
@@ -333,10 +347,14 @@ describe('context-guard full loop', () => {
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(2)
     expect(messages[0]!.text).toContain('收尾')
-    // The reminder sends the note to this session's own directory (the test
-    // session has no cwd, so the base is relative) and numbers the coming cut.
-    expect(messages[0]!.text).toContain('.handoff/sessions/a1/epoch-1.handoff.md')
-    expect(messages[0]!.text).toContain('第 1 次压缩')
+    // Since 0.6.0 the reminder hands state to the ticket platform instead of
+    // writing a `.handoff` note: no note path, and the ticket tools by name.
+    expect(messages[0]!.text).toContain('task_platform')
+    expect(messages[0]!.text).toContain('create_ticket')
+    expect(messages[0]!.text).toContain('change_ticket_status')
+    expect(messages[0]!.text).toContain('接力总结')
+    expect(messages[0]!.text).not.toContain('.handoff')
+    expect(messages[0]!.text).not.toContain('notePath')
     expect(messages[0]!.text).not.toContain('文件名自定')
     const wrapUpSeq = messages[0]!.seq
     const wrapUpResponse = [...agent.session.snapshotEvents()].find(e =>
@@ -1055,7 +1073,7 @@ describe('resume archive pointers', () => {
   it('names no file when the frame is a foreign (model-written) summary', async () => {
     const { ctx, agent, compaction, adapter } = await harness(
       [textResponse('first'), textResponse('resumed')],
-      {},
+      { resumePrompt: ARCHIVE_RESUME_TEMPLATE },
       4000,
     )
     await vi.waitFor(() => {
@@ -1079,7 +1097,7 @@ describe('resume archive pointers', () => {
   it('names the engine frame\'s artifacts when they exist on disk', async () => {
     const { ctx, agent, compaction, adapter } = await harness(
       [textResponse('first'), textResponse('resumed')],
-      {},
+      { resumePrompt: ARCHIVE_RESUME_TEMPLATE },
       4000,
     )
     await vi.waitFor(() => {
@@ -1108,7 +1126,7 @@ describe('resume archive pointers', () => {
   it('withholds a pointer whose file is gone, even in the engine frame', async () => {
     const { ctx, agent, compaction, adapter } = await harness(
       [textResponse('first'), textResponse('resumed')],
-      {},
+      { resumePrompt: ARCHIVE_RESUME_TEMPLATE },
       4000,
     )
     await vi.waitFor(() => {
@@ -1185,7 +1203,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     const cwd = await workspace()
     const { ctx, agent, compaction, adapter } = await harness(
       [textResponse('first'), textResponse('resumed')],
-      {},
+      { resumePrompt: ARCHIVE_RESUME_TEMPLATE },
       4000,
       true,
       rawSidecar(),
@@ -1284,7 +1302,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     const cwd = await workspace()
     const { ctx, agent, compaction, adapter } = await harness(
       [textResponse('first'), textResponse('resumed once'), textResponse('grown'), textResponse('resumed twice')],
-      {},
+      { resumePrompt: ARCHIVE_RESUME_TEMPLATE },
       4000,
       true,
       rawSidecar(),
@@ -1325,7 +1343,7 @@ describe('side-car archiving beside a foreign compaction engine', () => {
     const cwd = await workspace()
     const { ctx, agent, compaction, adapter } = await harness(
       [textResponse('first'), textResponse('resumed')],
-      {},
+      { resumePrompt: ARCHIVE_RESUME_TEMPLATE },
       4000,
       true,
       undefined,

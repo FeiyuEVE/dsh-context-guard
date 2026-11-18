@@ -18,6 +18,7 @@ overrides:
   '@deepseek-ai/dsh-settings': link:../deepseek-harness/packages/settings/settings
   '@deepseek-ai/dsh-session-projection': link:../deepseek-harness/packages/session/session-projection
   '@deepseek-ai/dsh-tools': link:../deepseek-harness/packages/core/tools
+  '@deepseek-ai/dsh-tool-testkit': link:../deepseek-harness/packages/test-support/tool-testkit
 
 importers:
 
@@ -60,6 +61,9 @@ importers:
       '@deepseek-ai/dsh-session-projection':
         specifier: link:../deepseek-harness/packages/session/session-projection
         version: link:../deepseek-harness/packages/session/session-projection
+      '@deepseek-ai/dsh-tool-testkit':
+        specifier: link:../deepseek-harness/packages/test-support/tool-testkit
+        version: link:../deepseek-harness/packages/test-support/tool-testkit
       '@deepseek-ai/dsh-tools':
         specifier: link:../deepseek-harness/packages/core/tools
         version: link:../deepseek-harness/packages/core/tools

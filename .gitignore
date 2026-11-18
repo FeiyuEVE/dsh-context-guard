@@ -6,3 +6,6 @@ lib/
 
 # 压缩归档（守卫落盘，体量大且含原始对话）：格式契约见 docs/digest-format.md
 .handoff/
+
+# 本地验证临时产物（构建 / 测试中间目录）
+.tmp/

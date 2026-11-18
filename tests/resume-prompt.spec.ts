@@ -13,6 +13,23 @@ import {
 } from '../src/resume-prompt.ts'
 import type { ResumeFacts } from '../src/resume-prompt.ts'
 
+/** The built-in reminder, pinned verbatim so a silent reword cannot slip through. */
+const WRAP_UP_GOLDEN = [
+  '当前上下文已经很长了 —— 这不是因为碰到了上限，而是因为上下文越长，后续每次请求越贵。',
+  '所以请收尾，但不是必须立刻停手：先把**不适合中断**的事情做完（正在进行的编辑、已经发出还没拿到结果的命令、当次工具调用的收尾），不要再展开新的探索或大范围重读。然后：',
+  '1) 把当前正在负责的工单同步到待办平台（本会话挂了 `task_platform` MCP 时用 `change_ticket_status` 推阶段、`add_comment` 记结论与证据；没挂就写清工单号与状态）：**新出现的待办必须先 `create_ticket` 建单**，不许只留在对话里；连一张工单都没接的临时活，也先建单再继续；',
+  '2) 用 todo_write 写一份短清单（只作本段上下文被摘要后的临时补充，权威状态在单据上）；',
+  '3) 在回复末尾输出一段 ≤200 字、自包含的接力总结：结论 + 工单号 + 下一步（截断后它是上下文里唯一的对话帧）；',
+  '4) 收尾完成后停下即可。',
+].join('\n')
+
+/** The built-in continuation, pinned verbatim: tickets first, no archive read. */
+const RESUME_GOLDEN = [
+  '上下文已压缩。',
+  '先看单据，不要凭对话记忆：用 `task_platform` 的 `list_tickets` / `get_ticket` 拉出当前负责的工单（需要结论与证据细节时用 `list_comments`），确认每张单的阶段与最近一条记录；以工单状态为准确认进度，然后继续执行未完成的工单，直到该工单被推进到应到的状态。',
+  '本段没有单据信息时，先用 todo_write 里的清单兜底，并立即把缺的工单补建到待办平台。',
+].join('\n')
+
 /** Facts with every frequency-related field overridable. */
 function facts(overrides: Partial<ResumeFacts> = {}): ResumeFacts {
   return {
@@ -29,13 +46,47 @@ function facts(overrides: Partial<ResumeFacts> = {}): ResumeFacts {
   }
 }
 
+describe('built-in templates', () => {
+  it('pins the wrap-up reminder verbatim and hands state to the ticket platform', () => {
+    expect(DEFAULT_WRAP_UP_PROMPT).toBe(WRAP_UP_GOLDEN)
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('task_platform')
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('`change_ticket_status`')
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('`add_comment`')
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('`create_ticket`')
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('接力总结')
+  })
+
+  it('keeps the default wrap-up reminder free of the note-file hand-off', () => {
+    // The placeholder still exists for custom templates; the built-in text no
+    // longer sends the agent to a `.handoff` note.
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('notePath')
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('.handoff')
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('接力笔记')
+  })
+
+  it('pins the resume prompt verbatim and starts from the tickets', () => {
+    expect(DEFAULT_RESUME_PROMPT).toBe(RESUME_GOLDEN)
+    expect(DEFAULT_RESUME_PROMPT).toContain('task_platform')
+    expect(DEFAULT_RESUME_PROMPT).toContain('`list_tickets`')
+    expect(DEFAULT_RESUME_PROMPT).toContain('`get_ticket`')
+    expect(DEFAULT_RESUME_PROMPT).toContain('`list_comments`')
+  })
+
+  it('keeps the archive clause out of the default resume prompt', () => {
+    expect(DEFAULT_RESUME_PROMPT).not.toContain('{{archive}}')
+    expect(DEFAULT_RESUME_PROMPT).not.toContain('digest')
+    const prompt = decideResume(DEFAULT_RESUME_PROMPT, facts(), { escalation: true }).prompt
+    expect(prompt).not.toContain('本次压缩的交接文档')
+    expect(prompt).not.toContain('/w/.handoff/sessions/a1/epoch-1.digest.md')
+  })
+})
+
 describe('decideResume', () => {
   it('stays at L0 for the first compaction of the window', () => {
     const decision = decideResume(DEFAULT_RESUME_PROMPT, facts(), { escalation: true })
     expect(decision.level).toBe('L0')
     expect(decision.suppress).toBe(false)
-    expect(decision.prompt).toContain('epoch-1.digest.md')
-    expect(decision.prompt).toContain('epoch-1.raw.md')
+    expect(decision.prompt).toContain('task_platform')
     expect(decision.prompt).toContain('继续执行')
     expect(decision.prompt).not.toContain('增量推进')
   })
@@ -61,6 +112,12 @@ describe('decideResume', () => {
     expect(withoutTool.level).toBe('L2')
     expect(withoutTool.prompt).not.toContain('subagent')
     expect(withoutTool.prompt).toContain('按需片段')
+    // The L2 stop-note now lands on the ticket platform, not in `.handoff`.
+    expect(withoutTool.prompt).not.toContain('.handoff')
+    expect(withoutTool.prompt).toContain('task_platform')
+    expect(withoutTool.prompt).toContain('`add_comment`')
+    expect(withoutTool.prompt).toContain('`change_ticket_status`')
+    expect(withoutTool.prompt).toContain('再停下向用户报告')
   })
 
   it('carries the division of labour on a continuation that can delegate', () => {
@@ -121,8 +178,15 @@ describe('decideResume', () => {
     expect(decision.prompt).toContain('- 跑回归')
   })
 
-  it('names the digest placeholder even when the backend wrote none', () => {
-    const decision = decideResume(DEFAULT_RESUME_PROMPT, facts({ digestPath: undefined, rawPath: undefined }), { escalation: true })
+  it('substitutes {{archive}} and {{digest}} for a custom template', () => {
+    const decision = decideResume('{{archive}}\n摘要：{{digest}}\n继续执行。', facts(), { escalation: true })
+    expect(decision.prompt).toContain('本次压缩的交接文档')
+    expect(decision.prompt).toContain('/w/.handoff/sessions/a1/epoch-1.digest.md')
+    expect(decision.prompt).toContain('继续执行')
+  })
+
+  it('renders the no-archive clause when a custom template asks and nothing was written', () => {
+    const decision = decideResume('{{archive}}', facts({ digestPath: undefined, rawPath: undefined }), { escalation: true })
     // The handoff clause states plainly that nothing was archived, instead of
     // claiming the history was archived and then naming a missing file.
     expect(decision.prompt).toContain('本次压缩没有生成归档文档')
@@ -174,8 +238,8 @@ describe('archiveClause', () => {
       .toBe('本次压缩没有生成归档文档；上面那段摘要就是本次压缩的全部交接内容。')
   })
 
-  it('is rendered into the built-in template and never asks the agent to check the file', () => {
-    const prompt = decideResume(DEFAULT_RESUME_PROMPT, facts(), { escalation: true }).prompt
+  it('is rendered into a custom template and never asks the agent to check the file', () => {
+    const prompt = decideResume('{{archive}}', facts(), { escalation: true }).prompt
     expect(prompt).toContain('本次压缩的交接文档')
     expect(prompt).toContain('epoch-1.digest.md')
     expect(prompt).toContain('epoch-1.raw.md')
@@ -201,6 +265,7 @@ describe('buildWrapUpPrompt', () => {
   it('renders the built-in template and appends the live todo list', () => {
     const prompt = buildWrapUpPrompt(DEFAULT_WRAP_UP_PROMPT, { todos: ['未完成任务 A'], ...note })
     expect(prompt).toContain('收尾')
+    expect(prompt).toContain('task_platform')
     expect(prompt).toContain('todo_write')
     expect(prompt).toContain('接力总结')
     expect(prompt).toContain('- 未完成任务 A')
@@ -217,14 +282,18 @@ describe('buildWrapUpPrompt', () => {
     expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('接近上限')
   })
 
-  it('names the session-scoped note and its compaction number', () => {
+  it('no longer names a note file, while custom templates can still use {{notePath}}', () => {
     const prompt = buildWrapUpPrompt(DEFAULT_WRAP_UP_PROMPT, { todos: [], ...note })
-    // The path is the session's own directory, not the flat .handoff/ inbox.
-    expect(prompt).toContain('`/w/.handoff/sessions/a1/epoch-3.handoff.md`')
-    expect(prompt).not.toContain('.handoff/ 目录下的一个 md 文件')
-    // Both the title and the prose carry the ordinal.
-    expect(prompt).toContain('# 第 3 次压缩 · 接力笔记 · <一句话主题>')
-    expect(prompt).toContain('本会话第 3 次压缩')
+    expect(prompt).not.toContain('notePath')
+    expect(prompt).not.toContain('.handoff')
+    expect(prompt).not.toContain('接力笔记')
+    expect(prompt).not.toContain('epoch-3.handoff.md')
+
+    // The placeholder mechanism stays: the guard keeps computing the path, a
+    // hand-written template keeps receiving it (with either spelling).
+    const custom = buildWrapUpPrompt('第 {{epoch}} 次压缩 · 写到 {{notePath}}', { todos: [], ...note })
+    expect(custom).toContain('第 3 次压缩')
+    expect(custom).toContain('/w/.handoff/sessions/a1/epoch-3.handoff.md')
   })
 
   it('substitutes {{todos}} and stays empty when the template is disabled', () => {

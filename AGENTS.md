@@ -2,13 +2,16 @@
 
 ## 项目定位
 
-DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上下文占用，超阈值时提醒 agent 收尾、
-空闲时自动压缩超阈值会话、压缩后写一份**确定性接力摘要（digest）**并按压缩频率分级续跑任务。
+DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上下文占用，超阈值时提醒 agent 收尾
+（把进度落到待办平台的工单上）、空闲时自动压缩超阈值会话、压缩后仍写一份**确定性接力摘要
+（digest）**，并按压缩频率分级续跑任务（先看单据确认进度，不再要求先读归档）。
 
 每个会话一个闭环，由四个事件驱动（各自有开关）：
 
 1. `step/end`（经 `session/event` 分发）：超阈值且该步骤仍欠一次模型请求（assistant 带 tool-call）
    时，把收尾提醒排队，经 `agent/pre-step` 折叠进下一步进入消息；同一超阈值周期只提醒一次。
+   内置文案要求先把工单同步到 `task_platform`（`change_ticket_status` / `add_comment`，新待办先
+   `create_ticket`）再停 —— 工单是跨压缩、跨会话的唯一权威状态载体（0.6.0 起不再写 handoff 笔记）。
    **折叠前复检**（0.5.0）：排队到折叠之间可能已经压过（别人的 `compaction-basic` 压力通道跑在同一个
    `agent/pre-step` 上），读数也可能回落 —— 复检不成立就丢弃并复位本周期，见 `reminderOutlived()`。
 2. `agent/status` idle：仍超阈值则 `compaction.compactNow()`；同一超阈值周期只压缩一次
@@ -63,14 +66,14 @@ DSH 上下文压力守卫插件（Host + Web Client 两半）：监控会话上�
 | `src/digest.ts` | 确定性事实抽取与 digest 渲染（`extractFacts`/`composeDigest`/`parseDigest`/`carriedFrom`） |
 | `src/paths.ts` | 落点计算：`sessionDirName`/`archiveLocation`/`digestPointerCandidates` |
 | `src/settings.ts` | 本行实时字段（`settingsFields`/`ContextGuardSettingsFields`）：schema、默认值、优先级解析、引擎侧用户层读取（`userLayerOf`） |
-| `src/resume-prompt.ts` | 纯函数提示词渲染：`decideResume`(L0–L3)、`archiveClause`（`{{archive}}` 交接文档声明块）、`buildWrapUpPrompt`、内置默认模板 |
+| `src/resume-prompt.ts` | 纯函数提示词渲染：`decideResume`(L0–L3)、`archiveClause`（`{{archive}}` 交接文档声明块）、`buildWrapUpPrompt`、内置默认模板（0.6.0 起以工单为中心；`{{archive}}`/`{{notePath}}` 只服务自定义模板） |
 | `src/session-facts.ts` | 结构化读会话：压缩节奏、可用委派工具、待办、最后一次人类意图 |
 | `src/messages-to-md.ts` | 纯函数清洗：会话区段 → Markdown（无 I/O、无时间戳、可 golden 测试） |
 | `src/sanitize.ts` | 归档文本卫生：剥 ANSI、CR→LF、NUL→`␀`、丢其余 C0/DEL（写盘器统一调用） |
 | `src/log.ts` | 单行日志 sink：`context-guard[/scope]: event k=v`，同时投递 `ctx.logger` 与 console |
 | `src/notice.ts` | 本插件自己的 `MessageSourceMap` kind（`context-guard`）+ notice 源构造/读取（V4 无 catch-all `plugin` kind） |
 | `src/client.js` | 浏览器端源码：`settings.section`「上下文守卫」三组表单 |
-| `tests/` | vitest：11 个 spec + mock adapter / stub 引擎，无网络 |
+| `tests/` | vitest：10 个 spec + mock adapter / stub 引擎，无网络 |
 | `docs/digest-format.md` | digest 格式契约（结构、抽取口径、预算梯度、继承、版本规则、边界） |
 | `docs/gotchas.md` | 工程坑与历史教训（构建发布、settings 优先级、归档、日志） |
 | `cordis.patch.yml` | bundle patch：只 insert 一行 `context-guard` → `@feiyueve/dsh-context-guard` |
@@ -118,11 +121,16 @@ npm run verify      # typecheck && test && build（顺序固定）
   →「非文本文件，暂时无法预览。」），而工具结果里带 NUL 是常态（`/proc/<pid>/cmdline` 用 NUL 分隔）。
   规则放在写盘器、不放渲染器：新增渲染路径自动受保护。**代价**：raw 不再是逐字节无损，逐字节原文
   在会话日志里。新增/修改归档渲染时，用例必须同时断言「无 NUL」与「无残留 ANSI」。
-- **接力笔记同落点**：收尾提示词的 `{{notePath}}` = 该会话目录下的 `epoch-<即将这次序号>.handoff.md`
-  （序号 = 本会话压缩总数 + 1，与续跑提示 `{{epoch}}` 同一事实源），标题要求
-  `# 第 N 次压缩 · 接力笔记 · <主题>`；守卫只算路径、不建目录（`write` 工具自建父目录），
-  所以空目录仍等于「从未归档」。
-- **续跑提示里的路径必须为真**，两个来源按可信度排序：①守卫按 `compactionId` 存下的**旁挂写盘记录**
+- **工单是交接载体，`.handoff` 笔记降为可选（0.6.0 起）**：内置收尾提示词不再要求写接力笔记，
+  改为把当前负责的工单同步到 `task_platform`（`change_ticket_status` 推阶段、`add_comment` 记结论
+  与证据；新待办先 `create_ticket`，没挂 MCP 就写清工单号与状态）。默认续跑提示先
+  `list_tickets`/`get_ticket`（必要时 `list_comments`）确认进度，本段没有单据信息时才用 todo_write
+  兜底并补建工单。`{{notePath}}` 占位符仍保留：守卫照旧算出该会话目录下的
+  `epoch-<即将这次序号>.handoff.md`（序号 = 本会话压缩总数 + 1，与 `{{epoch}}` 同一事实源），但只算
+  路径、不建目录（`write` 工具自建父目录）、不再默认写入；所以 `.handoff/sessions/` 为空仍等于
+  「从未归档」，只是不再等于「没有交接」。
+- **续跑模板里的归档路径必须为真**（内置模板不再引用归档；只有自定义模板用了 `{{archive}}`、
+  或 L3 抑制告示时才会出现）：两个来源按可信度排序：①守卫按 `compactionId` 存下的**旁挂写盘记录**
   （写盘同步完成，记录里直接就是 `Artifacts`）；②本引擎的指针帧（帧首 `FRAME_MARKER` 标记归属，
   外域摘要一律不认）。两者都只收绝对路径、都要落盘确认；确认到就渲染 `{{archive}}` 声明块
   （说明文档在哪、不要求通读），都没有则如实渲染成「本次压缩没有生成归档文档」。

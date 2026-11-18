@@ -54,7 +54,7 @@ window.__ModuleLoader__.load({
 
       // 接力摘要
       digestTitle: '接力摘要',
-      digestHint: '压缩时把被裁区间确定性抽取成一份精简事实摘要（零模型调用），落盘为 epoch-<N>.digest.md；续跑提示会让 agent 先读它，需要细节再去会话日志里检索。',
+      digestHint: '压缩时把被裁区间确定性抽取成一份精简事实摘要（零模型调用），落盘为 epoch-<N>.digest.md。内置续跑模板不再要求先读它（先看 task_platform 单据）；需要时可在自定义续跑模板里用 {{archive}} 指过去，细节改从会话日志检索。',
       digestEnabled: '生成摘要文档',
       digestMaxTokens: '摘要上限（tokens）',
       digestMaxTokensHint: '摘要正文字数上限，默认 800。数值越大信息越多、回读越贵。',

@@ -1,8 +1,8 @@
 # dsh-context-guard
 
-DeepSeek Harness 上下文压力守卫插件：监控会话上下文占用，超过阈值时提醒 agent 收尾、空闲时自动压缩、压缩后写一份**确定性接力摘要**并按压缩频率分级续跑任务。
+DeepSeek Harness 上下文压力守卫插件：监控会话上下文占用，超过阈值时提醒 agent 收尾（把进度落到待办平台的工单上）、空闲时自动压缩、压缩后按压缩频率分级续跑任务（先看单据确认进度，不再要求先读归档）。
 
-Context-pressure guard plugin for DeepSeek Harness: watches session context usage, reminds the agent to wrap up above a threshold, compacts over-threshold idle sessions, writes a deterministic relay digest for each compaction, and resumes the task at a level that escalates with compaction frequency.
+Context-pressure guard plugin for DeepSeek Harness: watches session context usage, reminds the agent to wrap up above a threshold (syncing state to the ticket platform), compacts over-threshold idle sessions, still writes a deterministic relay digest for each compaction, and resumes the task from the tickets at a level that escalates with compaction frequency.
 
 ## 设置面板（Web UI）/ Settings UI
 
@@ -29,7 +29,8 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 
 1. **hook `step/end`** —— 步骤结束时评估会话上下文（`tokenMeter` 测量 / 路由模型的 `contextWindow`）。
    超过阈值、且该步骤仍欠模型一次请求（assistant 消息带工具调用）时，把收尾提醒折叠进
-   下一步的进入消息，agent 看到后收尾并停轮；同一超阈值周期只提醒一次。
+   下一步的进入消息，agent 看到后收尾并停轮；同一超阈值周期只提醒一次。内置提醒要求先完成不适合
+   中断的动作，再把工单同步到 `task_platform`（新待办先 `create_ticket` 建单）并给一段接力总结。
    **折叠前会再核一次这条提醒还成不成立**：这中间发生的压缩（preset 自己的 `compaction-basic`
    压力通道就跑在同一个 `agent/pre-step` 上）会作废它，读数已经回落到阈值以下也会被丢弃 ——
    拿一条过期的读数去叫停，比不提醒更糟。
@@ -68,9 +69,9 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 
 ```
 <cwd>/.handoff/sessions/<会话id>/
-  epoch-N.digest.md       确定性事实摘要（续跑后第一份要读的文档）
+  epoch-N.digest.md       确定性事实摘要（旁挂/接管产物；内置续跑模板不再要求先读它）
   epoch-N.raw.md          无损全文归档（**默认不写**，需开启 writeRawArchive）
-  epoch-N.handoff.md      收尾接力笔记（**由 agent 按收尾提示词写**，不是引擎产物）
+  epoch-N.handoff.md      旧版收尾接力笔记：0.6.0 起内置提示词不再写；自定义 `{{notePath}}` 模板仍会落在这里
   latest-digest.txt       → 最新 digest 的绝对路径
   latest.txt              → 最新 raw 的绝对路径（仅开启 writeRawArchive 时）
 ```
@@ -81,10 +82,11 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
   tokens），细节改从会话日志检索（`session.v3.jsonl.zstd`）。需要 raw 时在设置面板打开
   「写完整原文归档」，或设 `writeRawArchive: true`。
 
-- **接力笔记也按会话分目录**：收尾提示词里的 `{{notePath}}` 由守卫算出（`epoch-N.handoff.md`，
-  `N` = 本会话第几次压缩，即将发生的那次），并要求文件**首行标题**写成
-  `# 第 N 次压缩 · 接力笔记 · <主题>`。守卫只算路径、不写文件（`write` 工具会自建父目录），
-  所以「`.handoff/sessions/` 不存在」仍然等于「这个会话从未归档」。
+- **工单才是交接载体（0.6.0 起）**：内置收尾提示词不再写接力笔记，改为要求把当前负责的工单同步到
+  `task_platform`（`change_ticket_status` 推阶段、`add_comment` 记结论与证据，没挂 MCP 就写清工单号
+  与状态）；新出现的待办先 `create_ticket` 建单，「只留在对话里」不再算数。`{{notePath}}` 占位符仍
+  保留给自定义模板：守卫照旧算出 `epoch-N.handoff.md`（`N` = 本会话第几次压缩，即将发生的那次），
+  但只算路径、不写文件（`write` 工具会自建父目录）。
 
 - **digest 是纯代码抽取的事实清单**（意图原文 / 文件读写次数 / 报错行 / 待办 / 重复调用），不调用
   模型、逐字节可复现；体积默认 ≤800 tokens。**digest 才是「0 token 摘要」**：raw 只是同一区间的
@@ -92,8 +94,8 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 - **跨次继承**：新 digest 继承上一次的意图/概念/文件/报错小节，避免第二段压缩丢掉更早的历史
   （「摘要的摘要」）。绝不跨会话继承，版本不符则放弃继承。
 - **进入上下文的只有短帧**，不是 digest 正文：接管模式下，帧给路径 + 读取规则（`regionTokens ≥ 600`
-  时另加一行 ≤60 字线索）；旁挂模式下 checkpoint 由别人的压缩机决定，路径通过**续跑提示**进入上下文
-  （见下）。格式契约见 [`docs/digest-format.md`](docs/digest-format.md)。
+  时另加一行 ≤60 字线索）；旁挂模式下 checkpoint 由别人的压缩机决定，路径只在自定义模板使用
+  `{{archive}}`（或 L3 抑制告示）时进入上下文。格式契约见 [`docs/digest-format.md`](docs/digest-format.md)。
 - **旁挂模式的两点取舍**：
   1. **写盘是同步堵塞的**：`session/event` 是 cordis 的 `emit`（同步分发、**不等待**监听器返回值），
      `compaction/summary` 之后**紧接**（中间无 `await`）就是区间替换 —— 监听器唯一能保证「先落盘」
@@ -101,21 +103,22 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
      返回时 `epoch-N.digest.md`（以及开启时的 `epoch-N.raw.md`）已经在盘上，**严格早于**替换消息生效。
      代价：调用方每次压缩多等几毫秒；归档盘卡住会拖住压缩调用方。写盘一律 tmp + `rename`，
      不会留半截文件。（对比 0.3.5：那时是 fire-and-forget，落盘只是**通常**早于替换。）
-  2. 路径只能靠**续跑提示**进上下文：checkpoint 是别人的摘要，不会带我们的路径。关掉
+  2. 路径只能靠**续跑提示**进上下文（内置模板不再引用归档，所以默认只在 L3 抑制告示或自定义
+     `{{archive}}` 模板里出现）：checkpoint 是别人的摘要，不会带我们的路径。关掉
      `resumeAfterCompact`、agent 非空闲（压缩发生在轮内时由那一轮自己继续）、或下一次压缩裁掉那条
      消息时，模型看不到路径（文件仍在磁盘上）。
 
 ### 分级续跑
 
 固定不变的续跑提示在短时间内第二次压缩后已被证明无效（agent 本来就一直在跑，要改的是工作方式）。
-因此提示由**可测量事实**渲染（窗口内自动压缩次数、digest 路径、待办、会话请求头里实际存在的委派
-工具）：
+因此提示由**可测量事实**渲染（窗口内自动压缩次数、待办、会话请求头里实际存在的委派工具；归档路径
+仍渲染给自定义 `{{archive}}` 模板）：
 
 | 级别 | 触发 | 文本 |
 |---|---|---|
-| `L0` | 窗口内 ≤1 次（或关闭分级） | 基础模板（含摘要路径，及开启时的 raw 路径）+ **分工条款**（可委派时） |
+| `L0` | 窗口内 ≤1 次（或关闭分级） | 基础模板（先看 `task_platform` 的单据确认进度，没有单据就用 todo_write 兜底）+ **分工条款**（可委派时） |
 | `L1` | 窗口内 =2 次 | 追加「改为增量推进：只读确需片段、结论写进 todo_write」 |
-| `L2` | 窗口内 ≥3 次 | 追加「先拆分再继续」：会话**确实**带 `subagent`/`subagent_fork`/`workflow`/`ralph` 时点名委派，否则给「按需取片」方案 |
+| `L2` | 窗口内 ≥3 次 | 追加「先拆分再继续」：会话**确实**带 `subagent`/`subagent_fork`/`workflow`/`ralph` 时点名委派，否则给「按需取片」方案；收敛不了时把状态落到工单评论与阶段再停 |
 | `L3` | 窗口内 ≥`resumeMaxPerWindow`（默认 5） | **不唤醒**：只留一条提示（「本次不再自动续跑」；无 goal 时排 `next-turn`，有 goal 时放下一步），归档与摘要照常落盘 |
 
 - 窗口默认 30 分钟，**窗口内出现新的人类消息会重新计数**（只统计 `sourceCommandId === undefined`
@@ -153,14 +156,14 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
   两层都没有时插件照常加载，hook 1 可用，hook 2/3 降级并记录一次警告，**不会 pending、不会阻塞启动**。
 - 越界配置（如 `thresholdRatio: 2`）不抛错：记录 `error` 日志并回退 0.85。
 - 归档写盘失败只 `warn` 不抛：帧降级为「无路径」或「只有 digest」，压缩本身照常成功。
-- **续跑提示里的归档路径只在真有时才写**，两个来源按可信度排序：
+- **续跑模板里的归档路径只在真有时才写**（`{{archive}}`，内置模板已不再使用），两个来源按可信度排序：
   1. **守卫自己的记录** —— 旁挂归档写完时按 `compactionId → {rawPath, digestPath}` 记下（写盘同步
      完成，所以记录里就是落盘结果本身）。这是 `compaction-basic` 会话唯一可用的来源，因为它的
      checkpoint 里根本没有路径。
   2. **本引擎的确定性指针帧** —— 帧首必须带 `dsh-context-guard 确定性归档` 标记（外域摘要一律不认）。
 
-  两个来源都会再落盘确认一次。确认到一个，就渲染 `{{archive}}` 声明块（文档在哪、建议先读 digest、
-  「不要求通读，但请知道它在那里」）；一个都没有时如实写「本次压缩没有生成归档文档；上面那段摘要
+  两个来源都会再落盘确认一次。确认到一个，就渲染进 `{{archive}}` 声明块（文档在哪、建议先读 digest、
+  「不要求通读，但请知道它在那里」；内置模板不再引用它，这枚占位符只服务自定义模板）；一个都没有时如实写「本次压缩没有生成归档文档；上面那段摘要
   就是本次压缩的全部交接内容」，而 `{{digest}}`/`{{raw}}` 渲染成「本次未生成摘要文件 / 归档文件」。
   守卫**不会**让 agent 自己去核查文件是否存在 —— 它已经查过了。
 - 所有监听器的运行期异常均被包含并记日志，任何情况下都不向外抛出。
@@ -230,7 +233,7 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `resumeWindowMinutes` | `30` | 统计窗口 |
 | `resumeMaxPerWindow` | `5` | 窗口内自动压缩上限（达到即 L3 不唤醒） |
 | `resumePromptTemplate` | `''` | 续跑提示词；**清空 = 关闭该注入** |
-| `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入**。内置文本是**柔和**版：说明「不是碰到了上限，而是上下文越长越贵」，要求先把不适合中断的事做完、别开新探索，收尾后停下 |
+| `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入**。内置文本是**柔和**版：说明「不是碰到了上限，而是上下文越长越贵」，要求先把不适合中断的事做完、别开新探索；随后把工单同步到 `task_platform`、新待办先建单，再给 ≤200 字接力总结并停下 |
 
 > 组合层（`cordis.patch.yml` 的 `wrapUpPrompt`/`resumePrompt`，0.1.7 之前唯一的键名）是这两个实时字段的
 > **回落层**：字段未设时用组合层文本，字段一设（**含空字符串**）就以它为准。清空字段并保存即可关掉对应
@@ -239,6 +242,10 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 
 续跑模板占位符：`{{epoch}}` `{{window}}` `{{compactions}}` `{{archive}}` `{{digest}}` `{{raw}}`
 `{{intent}}`；收尾模板占位符：`{{todos}}` `{{notePath}}` `{{epoch}}`。未知占位符原样保留。
+
+内置模板自 0.6.0 起**不使用** `{{archive}}` 与 `{{notePath}}`：默认续跑先看 `task_platform` 单据，
+默认收尾不再写 `.handoff` 笔记。两枚占位符完整保留给自定义模板（本行实时字段或组合层文本）；
+内置续跑文本不会再让 agent 去读 digest/raw，只有 L3 抑制告示仍附归档位置。
 
 - `{{archive}}` 是**交接文档声明块**：有归档时给出摘要路径（开启全文归档时再加 raw 路径）并说明
   「不要求通读，但请知道它在那里，需要时可直接 read」，没有归档时如实说明本次没有归档文档。它只在
@@ -328,8 +335,8 @@ grep context-guard /path/to/dsh-web.log           # 启动器重定向的日志�
 - **并发安全**：`compacting` 标记防止同一会话的并发压缩；压缩信号在插件卸载时中止。
 - **写盘原子性**：tmp + `rename`；顺序（开启 raw 时）raw → `latest.txt` → digest → `latest-digest.txt`，
   指针最后移动；默认只走 digest → `latest-digest.txt` 两步。
-- **旁挂序号与收尾笔记同源**：`N = ` 本会话（含手动）压缩总数 `+ 1`。写盘时 `compaction/end` 还没追加，
-  所以这个数与收尾提示里的 `{{epoch}}`、以及盘上已有的最大编号（取较大者）一致，不会重号。
+- **旁挂序号与 `{{epoch}}` 同源**：`N = ` 本会话（含手动）压缩总数 `+ 1`。写盘时 `compaction/end` 还没追加，
+  所以这个数与自定义收尾模板里的 `{{epoch}}`、以及盘上已有的最大编号（取较大者）一致，不会重号。
 
 ## 模型体验 / Model Experience
 
@@ -355,7 +362,7 @@ npm run verify      # 三者全跑
 
 测试套件（`tests/`）通过真实 agent loop 驱动脚本化 mock adapter，覆盖完整闭环（提醒 → 收尾 → 空闲
 压缩 → 续跑）、阈值以下无动作、已收尾步骤不提醒、失败压缩不续跑、每个配置开关、每周期一次防循环
-语义、**旁挂归档**（外来后端写 digest、开启时另加 raw，并被续跑提示引用、跨次编号与继承、
+语义、**旁挂归档**（外来后端写 digest、开启时另加 raw，并被使用 `{{archive}}` 的续跑模板引用、跨次编号与继承、
 自家引擎不重复写、**默认只写 digest 而序号仍连续**、**替换消息派发那一刻归档已在盘上**），
 以及新增模块的纯函数契约：摘要抽取/预算梯度/继承与版本失配（`digest.spec.ts`）、落点与目录名
 清洗（`paths.spec.ts`）、分级续跑决策与 `{{archive}}` 声明块（`resume-prompt.spec.ts`）、会话事实读取
@@ -384,10 +391,12 @@ npm run verify      # 三者全跑
 - **压缩 `null` 时不重试**：`compactNow()` 返回 `null`（没有安全可裁区间）时本周期不再尝试压缩，只记日志。
 - digest 是**事实清单而非语义摘要**：它不试图理解内容，模型需要推理脉络时仍要 `read` 完整归档。
 - `.handoff/` 根下 299 份历史 flat 归档**不迁移**（无法按会话归属），新版不再写根 `latest.txt`。
-  旧的收尾笔记（`<日期>-<主题>.md`）也留在根下不动：**0.3.4 起新笔记写进 `sessions/<会话id>/`**，
-  根目录不再增长。
-- 接力笔记的目录由守卫按 `<cwd>/.handoff` 默认基线 + 本行实时字段 `archiveLayout` 算出；
-  若压缩引擎行单独配了别的 `archiveDir`（不在本行的实时字段里），笔记与归档会分处两地。
+  旧的收尾笔记（`<日期>-<主题>.md`）也留在根下不动：**0.3.4 起会话内笔记写进 `sessions/<会话id>/`**，
+  根目录不再增长；**0.6.0 起内置提示词不再产生新笔记**，`sessions/<会话id>/` 里只会出现归档
+  （以及自定义模板主动写的笔记）。
+- `{{notePath}}` 的目录由守卫按 `<cwd>/.handoff` 默认基线 + 本行实时字段 `archiveLayout` 算出
+  （只有自定义模板会用到）；若压缩引擎行单独配了别的 `archiveDir`（不在本行的实时字段里），
+  自定义笔记与归档会分处两地。
   **旁挂归档同理**：它读本行的 `archiveLayout`，读不到引擎行的 `archiveDir`/`epochPrefix`。
 - 只归档**摘要式压缩**（`compaction/summary`）。同族里模型无关的 `compaction/prune` 不写归档 ——
   它是纯剪枝、没有摘要区间，混进同一套 `epoch-N` 编号会让 digest 与序号错位。

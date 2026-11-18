@@ -1,8 +1,8 @@
 # 接力摘要（digest）格式契约 / Digest Format Contract
 
 > 本文件是 `src/digest.ts` 产出文档的**格式契约**。读它的是三类消费者：下一次压缩的
-> carry-forward（`carriedFrom`）、host 侧的续跑提示、以及被唤醒后按路径 `read` 这个文件的
-> agent。任何一条被下面标为「契约」的规则改动，都必须同时 bump
+> carry-forward（`carriedFrom`）、host 侧的续跑提示（仅在自定义模板使用 `{{archive}}` 时）、以及
+> 被唤醒后按路径 `read` 这个文件的 agent。任何一条被下面标为「契约」的规则改动，都必须同时 bump
 > `DIGEST_FORMAT_VERSION`（`src/digest.ts`），否则旧文档会被新代码误读。
 
 ## 1. 为什么有第二个文件
@@ -17,7 +17,7 @@
 
 | 文件 | 性质 | 谁读 | 典型体量 |
 |---|---|---|---|
-| `epoch-N.digest.md` | **确定性事实清单**（不调用模型） | 续跑后**第一份**要读的文档 | ≤ 800 tokens（默认） |
+| `epoch-N.digest.md` | **确定性事实清单**（不调用模型） | 按需 `read`；自定义 `{{archive}}` 模板会指路（内置续跑先看工单，不再要求先读它） | ≤ 800 tokens（默认） |
 | `epoch-N.raw.md` | 逐字全文（逐角色逐块），**按需开启** | 需要精确原文时先 `grep` 再局部 `read` | ~286 KB / ≈64k tokens |
 
 digest 不是「模型写的摘要」，它是**纯代码抽取的事实列表**：意图原文、涉及文件与读写次数、报错行、
@@ -198,9 +198,10 @@ targetTokens = max(260, min(digestMaxTokens, regionTokens × digestTargetRatio))
 
 - **旁挂模式**（默认）：checkpoint 是原压缩机的产物（如 `compaction-basic` 的模型摘要），不含路径；
   路径改由**续跑提示**给出，来源是守卫按 `compactionId` 存的写盘记录（本文件不规定提示词文本，
-  见 `src/resume-prompt.ts` 的 `archiveClause`）。该模板片段（`{{archive}}`）**陈述文档存在与位置**
-  （「不要求通读，但请知道它在那里，需要时可直接 read」），不要求 agent 去核查文件 —— 守卫渲染前
-  已经落盘确认过。
+  见 `src/resume-prompt.ts` 的 `archiveClause`）。0.6.0 起内置模板不再引用 `{{archive}}`（先看
+  `task_platform` 单据），这枚占位符只服务自定义模板，L3 抑制告示也仍会附归档位置。该片段
+  **陈述文档存在与位置**（「不要求通读，但请知道它在那里，需要时可直接 read」），不要求 agent 去
+  核查文件 —— 守卫渲染前已经落盘确认过。
 
 **写盘时序是格式契约的一部分**：旁挂写盘在 `compaction/summary` 的监听器里**同步**跑完，所以后端
 追加替换消息（区间离开模型视野）时，本文件的 digest（以及开启时的 raw）已经在盘上；两条路（接管 / 旁挂）现在

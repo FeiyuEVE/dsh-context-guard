@@ -119,6 +119,7 @@
   2. **只收绝对路径** —— 裸文件名是「提及」不是「指向」；
   3. **落盘确认**（`existingFile`）—— 路径必须真是文件；确认不到时 `{{archive}}` 如实写
      「本次压缩没有生成归档文档」，`{{digest}}`/`{{raw}}` 退回「（本次未生成摘要文件 / 归档文件）」。
+     （0.6.0 起内置续跑模板不再引用 `{{archive}}`，这套解析只在自定义模板或 L3 抑制告示里生效。）
   回归用例：`tests/context-guard.spec.ts` 的 `resume archive pointers`（含外域摘要、真文件、文件已删
   三种）与 `tests/digest.spec.ts` 的 `digestPathFrom`。**排查口径**：非归档引擎的会话「没有归档」是
   正常态（`agentPreset: standard` → `compaction-basic`，事件里 `provider=deepseek-official`、
@@ -134,6 +135,8 @@
   提示词，落点都得由知道 id 的一方给出，别让模型自己编路径。
   另一个可选细节：`write` 工具（`fs-local/src/fsio.ts:581`）会 `mkdir -p` 父目录，所以插件不必预建目录 ——
   空目录因此仍是「该会话从未归档」的可判据。
+  **0.6.0 起状态改由工单承载**：内置收尾提示词不再写接力笔记，改为同步 `task_platform` 工单；上面这条
+  只对仍在使用 `{{notePath}}` 的自定义模板成立（路径解析与编号逻辑原样保留）。
 - **归档里的控制字节会让整份文档打不开（2026-09-12 用户提问发现）**：用户点开 raw 归档，Web 预览显示
   「**非文本文件，暂时无法预览。**」。这不是大小或路径问题，而是**一个 NUL 字节**。两条阅读路径各查一次：
   - `@deepseek-ai/dsh-fs-local/lib/index.js:355`（及流式读的 `:441`）：`raw.subarray(0, 8192).includes(0)`

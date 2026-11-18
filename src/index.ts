@@ -611,12 +611,16 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
-   * This session's wrap-up note: the path the reminder tells the agent to write,
-   * plus the compaction number both that path and the note title carry.
+   * This session's wrap-up facts: the `{{notePath}}` value plus the compaction
+   * number the epoch substitution carries.
    *
-   * The number is the *coming* compaction's — the note is written just before
-   * the cut it hands off from — counted the way the continuation prompt counts
-   * them: every compaction of this session, automatic or manual.
+   * Ticket state is the default hand-off carrier since 0.6.0, so the built-in
+   * reminder no longer writes the note; the path survives for hand-written
+   * templates that still want a session-scoped file.
+   *
+   * The number is the *coming* compaction's — a template that writes a note does
+   * so just before the cut it hands off from — counted the way the continuation
+   * prompt counts them: every compaction of this session, automatic or manual.
    *
    * The directory is deliberately not created here: the `write` tool creates
    * parent directories, and creating it eagerly would leave empty session
@@ -823,7 +827,6 @@ export function apply(ctx: Context, config: Config): void {
         digestTokens: recorded?.digestTokens,
         todos: pendingTodos(agent.session),
         intent: lastHumanIntent(agent.session),
-        noteDir: `${sessionArchiveDir(agent)}/`,
         delegationTools: delegation,
       }, { escalation: resolved.resumeEscalation })
       const promptTokens = estimateTextTokens(decision.prompt, resolved.digestTokenEstimator)
