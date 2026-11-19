@@ -352,7 +352,11 @@ describe('context-guard full loop', () => {
     expect(messages[0]!.text).toContain('task_platform')
     expect(messages[0]!.text).toContain('create_ticket')
     expect(messages[0]!.text).toContain('change_ticket_status')
-    expect(messages[0]!.text).toContain('接力总结')
+    // Since 0.6.1 the reminder stops after syncing the tickets; it no longer
+    // asks for a separate wrap-up summary block.
+    expect(messages[0]!.text).toContain('收尾完成后停下即可')
+    expect(messages[0]!.text).not.toContain('接力总结')
+    expect(messages[0]!.text).not.toContain('≤200')
     expect(messages[0]!.text).not.toContain('.handoff')
     expect(messages[0]!.text).not.toContain('notePath')
     expect(messages[0]!.text).not.toContain('文件名自定')

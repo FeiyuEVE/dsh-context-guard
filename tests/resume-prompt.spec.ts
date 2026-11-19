@@ -19,8 +19,7 @@ const WRAP_UP_GOLDEN = [
   '所以请收尾，但不是必须立刻停手：先把**不适合中断**的事情做完（正在进行的编辑、已经发出还没拿到结果的命令、当次工具调用的收尾），不要再展开新的探索或大范围重读。然后：',
   '1) 把当前正在负责的工单同步到待办平台（本会话挂了 `task_platform` MCP 时用 `change_ticket_status` 推阶段、`add_comment` 记结论与证据；没挂就写清工单号与状态）：**新出现的待办必须先 `create_ticket` 建单**，不许只留在对话里；连一张工单都没接的临时活，也先建单再继续；',
   '2) 用 todo_write 写一份短清单（只作本段上下文被摘要后的临时补充，权威状态在单据上）；',
-  '3) 在回复末尾输出一段 ≤200 字、自包含的接力总结：结论 + 工单号 + 下一步（截断后它是上下文里唯一的对话帧）；',
-  '4) 收尾完成后停下即可。',
+  '3) 收尾完成后停下即可：状态以工单为准，不需要在回复里另写收尾段落。',
 ].join('\n')
 
 /** The built-in continuation, pinned verbatim: tickets first, no archive read. */
@@ -53,7 +52,13 @@ describe('built-in templates', () => {
     expect(DEFAULT_WRAP_UP_PROMPT).toContain('`change_ticket_status`')
     expect(DEFAULT_WRAP_UP_PROMPT).toContain('`add_comment`')
     expect(DEFAULT_WRAP_UP_PROMPT).toContain('`create_ticket`')
-    expect(DEFAULT_WRAP_UP_PROMPT).toContain('接力总结')
+    expect(DEFAULT_WRAP_UP_PROMPT).toContain('收尾完成后停下即可')
+    // Since 0.6.1 the reminder no longer asks for a separate wrap-up block:
+    // tickets are the authoritative state carrier.
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('接力总结')
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('交接')
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('≤200')
+    expect(DEFAULT_WRAP_UP_PROMPT).not.toContain('截断后')
   })
 
   it('keeps the default wrap-up reminder free of the note-file hand-off', () => {
@@ -267,7 +272,8 @@ describe('buildWrapUpPrompt', () => {
     expect(prompt).toContain('收尾')
     expect(prompt).toContain('task_platform')
     expect(prompt).toContain('todo_write')
-    expect(prompt).toContain('接力总结')
+    expect(prompt).toContain('收尾完成后停下即可')
+    expect(prompt).not.toContain('接力总结')
     expect(prompt).toContain('- 未完成任务 A')
   })
 

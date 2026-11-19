@@ -214,7 +214,8 @@ describe('ArchiveCutEngine full loop (real engine, zero summarizer calls)', () =
     const messages = guardMessages(agent)
     expect(messages).toHaveLength(2)
     expect(messages[0]).toContain('收尾')
-    expect(messages[0]).toContain('接力总结')
+    expect(messages[0]).toContain('收尾完成后停下即可')
+    expect(messages[0]).not.toContain('接力总结')
     expect(messages[1]).toContain('继续')
 
     // The checkpoint frame the model sees points at the deterministic archive

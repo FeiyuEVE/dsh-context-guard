@@ -30,7 +30,8 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
 1. **hook `step/end`** —— 步骤结束时评估会话上下文（`tokenMeter` 测量 / 路由模型的 `contextWindow`）。
    超过阈值、且该步骤仍欠模型一次请求（assistant 消息带工具调用）时，把收尾提醒折叠进
    下一步的进入消息，agent 看到后收尾并停轮；同一超阈值周期只提醒一次。内置提醒要求先完成不适合
-   中断的动作，再把工单同步到 `task_platform`（新待办先 `create_ticket` 建单）并给一段接力总结。
+   中断的动作，再把工单同步到 `task_platform`（新待办先 `create_ticket` 建单），然后停下
+   （状态以工单为准，不再要求另写收尾内容）。
    **折叠前会再核一次这条提醒还成不成立**：这中间发生的压缩（preset 自己的 `compaction-basic`
    压力通道就跑在同一个 `agent/pre-step` 上）会作废它，读数已经回落到阈值以下也会被丢弃 ——
    拿一条过期的读数去叫停，比不提醒更糟。
@@ -82,7 +83,8 @@ Context-pressure guard plugin for DeepSeek Harness: watches session context usag
   tokens），细节改从会话日志检索（`session.v3.jsonl.zstd`）。需要 raw 时在设置面板打开
   「写完整原文归档」，或设 `writeRawArchive: true`。
 
-- **工单才是交接载体（0.6.0 起）**：内置收尾提示词不再写接力笔记，改为要求把当前负责的工单同步到
+- **工单才是交接载体（0.6.0 起，0.6.1 起收尾不再另写总结）**：内置收尾提示词不再写接力笔记，
+  也不再要求回复末尾另写一段收尾内容；改为要求把当前负责的工单同步到
   `task_platform`（`change_ticket_status` 推阶段、`add_comment` 记结论与证据，没挂 MCP 就写清工单号
   与状态）；新出现的待办先 `create_ticket` 建单，「只留在对话里」不再算数。`{{notePath}}` 占位符仍
   保留给自定义模板：守卫照旧算出 `epoch-N.handoff.md`（`N` = 本会话第几次压缩，即将发生的那次），
@@ -233,7 +235,7 @@ profile 的压缩后端配置。**默认可用的归档就是旁挂模式**：pr
 | `resumeWindowMinutes` | `30` | 统计窗口 |
 | `resumeMaxPerWindow` | `5` | 窗口内自动压缩上限（达到即 L3 不唤醒） |
 | `resumePromptTemplate` | `''` | 续跑提示词；**清空 = 关闭该注入** |
-| `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入**。内置文本是**柔和**版：说明「不是碰到了上限，而是上下文越长越贵」，要求先把不适合中断的事做完、别开新探索；随后把工单同步到 `task_platform`、新待办先建单，再给 ≤200 字接力总结并停下 |
+| `wrapUpPromptTemplate` | `''` | 收尾提示词；可用 `{{notePath}}`/`{{epoch}}`/`{{todos}}`；**清空 = 关闭该注入**。内置文本是**柔和**版：说明「不是碰到了上限，而是上下文越长越贵」，要求先把不适合中断的事做完、别开新探索；随后把工单同步到 `task_platform`、新待办先建单，最后明确停下（状态以工单为准，不再要求另写收尾段落） |
 
 > 组合层（`cordis.patch.yml` 的 `wrapUpPrompt`/`resumePrompt`，0.1.7 之前唯一的键名）是这两个实时字段的
 > **回落层**：字段未设时用组合层文本，字段一设（**含空字符串**）就以它为准。清空字段并保存即可关掉对应
